@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     canvas.rs
 // Location: laser-cnc-controller/src/canvas.rs
-// Version:  v0.1.1
+// Version:  v0.1.5
 // Comments: Mini-CAD canvas engine (millimetre world, Y up).
 //           Tools: Select, Pan, Move, Rectangle, Line, Circle.
 //           Mouse (FreeCAD OpenSCAD-style, adapted to 2D):
@@ -18,14 +18,30 @@
 //           Shape Properties dock slot at the end of the tool strip:
 //           "Shape Properties [Float]" while docked (panel hidden),
 //           "Shape Properties [Dock]" while floating. The app reads props_toggle.
+//           v0.1.2:
+//           - Origin tool: click (or drag-release) places the job origin
+//             marker (job 0,0). With Select, drag the marker to move it.
+//           - Work fence: rectangle 0..W by 0..H from the origin marker.
+//             Tool strip: Fence on/off toggle and W / H fields. With Select,
+//             drag the fence's top-right handle to resize it. ON = solid
+//             orange, OFF = dashed grey.
+//           - Toolpath drawing starts at the origin marker (Plan::origin).
+//           - SimOverlay carries an optional path (live Job/Trace run) drawn
+//             over the plan with done/current/remaining styling.
+//           - Status bar shows origin position and fence state.
+//           v0.1.3: head marker and the line to it are red while the laser is
+//           on, yellow while it is off (SimOverlay::laser).
+//           v0.1.4: Shape Properties dock slot removed from the tool strip
+//           (the panel now docks in the app's right column).
+//           v0.1.5: default grid spacing 5 mm.
 // =============================================================================
 use eframe::egui::{self,Color32,CursorIcon,Key,PointerButton,Pos2,Rect,Sense,Stroke,Vec2};
 use crate::geometry::{Operation,Project,Shape,ShapeKind};
-use crate::gcode::Plan;
+use crate::gcode::{Move,Plan};
 use crate::widgets::{self,Icon};
 
 #[derive(Clone,Copy,PartialEq,Debug)]
-pub enum Tool{Select,Pan,Move,Rectangle,Line,Circle}
+pub enum Tool{Select,Pan,Move,Origin,Rectangle,Line,Circle}
 
 pub const GRID_SPACINGS:[f32;5]=[0.1,0.5,1.0,5.0,10.0];
 const ZOOM_MIN:f32=0.2;
@@ -37,6 +53,8 @@ const C_SHAPE:Color32=Color32::from_rgb(175,178,186);
 const C_HOVER:Color32=Color32::from_rgb(225,228,235);
 const C_SELECT:Color32=Color32::from_rgb(90,170,255);
 const C_PREVIEW:Color32=Color32::from_rgb(255,196,64);
+const C_ORIGIN:Color32=Color32::from_rgb(80,220,230);
+const C_FENCE:Color32=Color32::from_rgb(240,150,40);
 
 enum Drag{
   None,
@@ -45,19 +63,22 @@ enum Drag{
   Handle{index:usize,handle:usize,original:Shape},
   Pan,
   Zoom{anchor:Pos2},
+  Origin{original:(f32,f32)},
+  FenceCorner{original:(f32,f32)},
 }
 
-/// Simulation overlay passed in from the app.
-pub struct SimOverlay{pub active:bool,pub index:usize,pub head:(f32,f32)}
+/// Simulation / live-run overlay passed in from the app.
+/// `path` None: progress applies to the plan's moves (simulation).
+/// `path` Some: a live run's own path (canvas coordinates) starting at `start`.
+pub struct SimOverlay<'a>{pub active:bool,pub index:usize,pub head:(f32,f32),pub start:(f32,f32),pub path:Option<&'a [Move]>,pub laser:bool}
 
 pub struct CanvasView{
   pub tool:Tool, pub grid:bool, pub grid_spacing:f32, pub snap:bool, pub zoom:f32,
-  pub props_floating:bool, pub props_toggle:bool,
   pan:Vec2, fit_pending:bool, last_rect:Rect,
   draw_start:Option<(f32,f32)>, move_base:Option<(f32,f32)>, drag:Drag,
 }
 impl Default for CanvasView{
-  fn default()->Self{Self{tool:Tool::Select,grid:true,grid_spacing:1.0,snap:true,zoom:2.0,props_floating:false,props_toggle:false,pan:Vec2::new(34.0,-28.0),
+  fn default()->Self{Self{tool:Tool::Select,grid:true,grid_spacing:5.0,snap:true,zoom:2.0,pan:Vec2::new(34.0,-28.0),
     fit_pending:true,last_rect:Rect::NOTHING,draw_start:None,move_base:None,drag:Drag::None}}
 }
 
@@ -89,6 +110,8 @@ impl CanvasView{
     match std::mem::replace(&mut self.drag,Drag::None){
       Drag::Move{originals,..}=>{for (i,o) in originals{if let Some(s)=project.shapes.get_mut(i){*s=o;}}}
       Drag::Handle{index,original,..}=>{if let Some(s)=project.shapes.get_mut(index){*s=original;}}
+      Drag::Origin{original}=>project.origin=original,
+      Drag::FenceCorner{original}=>{project.fence.w=original.0;project.fence.h=original.1;}
       _=>{}
     }
     self.draw_start=None;self.move_base=None;
@@ -110,6 +133,8 @@ impl CanvasView{
       }
     }).map(|(i,_)|i)
   }
+  fn near(&self,rect:Rect,w:(f32,f32),p:Pos2,px:f32)->bool{let q=self.to_screen(rect,w.0,w.1);(q.x-p.x).abs()<=px&&(q.y-p.y).abs()<=px}
+  fn fence_corner(project:&Project)->(f32,f32){(project.origin.0+project.fence.w,project.origin.1+project.fence.h)}
   fn handles(s:&Shape)->Vec<(f32,f32)>{
     let (x0,y0,x1,y1)=s.extent();let (xm,ym)=((x0+x1)/2.0,(y0+y1)/2.0);
     match s.kind{
@@ -184,6 +209,7 @@ impl CanvasView{
     ui.horizontal_wrapped(|ui|{
       ui.spacing_mut().item_spacing=Vec2::new(4.0,4.0);
       for (tool,icon,tip) in [(Tool::Select,Icon::Select,"Select"),(Tool::Pan,Icon::Pan,"Pan"),(Tool::Move,Icon::Move,"Move (click base point, click destination)"),
+                              (Tool::Origin,Icon::Origin,"Job origin: click to place job 0,0 (the spot you zero on the machine)"),
                               (Tool::Rectangle,Icon::Rectangle,"Rectangle (click corner, click opposite corner)"),
                               (Tool::Line,Icon::Line,"Line (click start, click end)"),(Tool::Circle,Icon::Circle,"Circle (click centre, click radius)")]{
         if tool==Tool::Rectangle{ui.separator();}
@@ -220,23 +246,21 @@ impl CanvasView{
       }
       if widgets::icon_button(ui,Icon::Fit,false,true,"Fit work area").clicked(){self.fit_pending=true;}
       ui.separator();
-      // Shape Properties dock slot.
-      egui::Frame::new().fill(ui.visuals().widgets.inactive.weak_bg_fill).corner_radius(5).inner_margin(egui::Margin::symmetric(8,3)).show(ui,|ui|{
-        ui.horizontal(|ui|{
-          ui.set_min_height(24.0);
-          ui.label("Shape Properties");
-          let label=if self.props_floating{"Dock"}else{"Float"};
-          let tip=if self.props_floating{"Hide the panel back into the tool strip"}else{"Open the panel as a floating window"};
-          if ui.small_button(label).on_hover_text(tip).clicked(){self.props_toggle=true;}
-        });
-      });
+      // Work fence: on/off and size (from the origin marker).
+      if widgets::icon_button(ui,Icon::Fence,project.fence.on,true,"Work fence on/off: program moves checked against it, jogs outside it refused once zero is set").clicked(){
+        project.fence.on=!project.fence.on;changed=true;
+      }
+      ui.label("W");
+      changed|=widgets::num_f32(ui,"fence_w",&mut project.fence.w,self.grid_spacing.max(1.0),1.0,3000.0,1,"");
+      ui.label("H");
+      changed|=widgets::num_f32(ui,"fence_h",&mut project.fence.h,self.grid_spacing.max(1.0),1.0,3000.0,1,"mm");
     });
     changed
   }
 
   // ---------------------------------------------------------------- canvas
   /// Draws the canvas and handles interaction. Returns true when geometry changed.
-  pub fn show(&mut self,ui:&mut egui::Ui,project:&mut Project,selected:&mut Vec<usize>,plan:&Plan,sim:&SimOverlay)->bool{
+  pub fn show(&mut self,ui:&mut egui::Ui,project:&mut Project,selected:&mut Vec<usize>,plan:&Plan,sim:&SimOverlay<'_>)->bool{
     let mut changed=false;
     selected.retain(|&i|i<project.shapes.len());
     let status_h=24.0;
@@ -268,6 +292,9 @@ impl CanvasView{
       let w=self.to_world(rect,origin);
       match self.tool{
         Tool::Pan=>self.drag=Drag::Pan,
+        Tool::Select if self.near(rect,project.origin,origin,HANDLE_PX+4.0)=>{self.drag=Drag::Origin{original:project.origin};}
+        Tool::Select if self.near(rect,Self::fence_corner(project),origin,HANDLE_PX+3.0)=>{self.drag=Drag::FenceCorner{original:(project.fence.w,project.fence.h)};}
+        Tool::Origin=>{}
         Tool::Select|Tool::Move=>{
           let handle=if self.tool==Tool::Select&&selected.len()==1{
             project.shapes.get(selected[0]).and_then(|s|self.handle_at(rect,s,origin)).map(|h|(selected[0],h))}else{None};
@@ -298,6 +325,8 @@ impl CanvasView{
         Drag::Handle{index,handle,original}=>{if let Some(c)=snapped{
           let s=Self::apply_handle(original,*handle,c);if let Some(t)=project.shapes.get_mut(*index){*t=s;}
         }}
+        Drag::Origin{..}=>{if let Some(c)=snapped{project.origin=c;}}
+        Drag::FenceCorner{..}=>{if let Some(c)=snapped{project.fence.w=(c.0-project.origin.0).max(1.0);project.fence.h=(c.1-project.origin.1).max(1.0);}}
         _=>{}
       }
     }
@@ -316,11 +345,14 @@ impl CanvasView{
             if pick&&!selected.contains(&i){selected.push(i);}
           }
         }}
-        Drag::Move{..}|Drag::Handle{..}=>changed=true,
+        Drag::Move{..}|Drag::Handle{..}|Drag::Origin{..}|Drag::FenceCorner{..}=>changed=true,
         _=>{}
       }
       if resp.drag_stopped_by(PointerButton::Primary)&&matches!(self.tool,Tool::Rectangle|Tool::Line|Tool::Circle){
         if let Some(e)=snapped{changed|=self.finish_draw(project,selected,e);}
+      }
+      if resp.drag_stopped_by(PointerButton::Primary)&&self.tool==Tool::Origin{
+        if let Some(e)=snapped{project.origin=e;changed=true;}
       }
     }
 
@@ -334,6 +366,7 @@ impl CanvasView{
           }
         }
         Tool::Pan=>{}
+        Tool::Origin=>{project.origin=s;changed=true;}
         Tool::Move=>{
           if selected.is_empty(){if let Some(i)=self.hit(project,w){*selected=vec![i];}}
           else if let Some(base)=self.move_base.take(){
@@ -368,12 +401,13 @@ impl CanvasView{
         (Drag::Pan,_)=>CursorIcon::Grabbing,
         (Drag::Zoom{..},_)=>CursorIcon::ZoomIn,
         (Drag::Move{..},_)=>CursorIcon::Move,
-        (Drag::Handle{..},_)=>CursorIcon::Crosshair,
+        (Drag::Handle{..}|Drag::Origin{..}|Drag::FenceCorner{..},_)=>CursorIcon::Crosshair,
         (_,Tool::Pan)=>CursorIcon::Grab,
         (_,Tool::Move)=>CursorIcon::Move,
-        (_,Tool::Rectangle|Tool::Line|Tool::Circle)=>CursorIcon::Crosshair,
+        (_,Tool::Rectangle|Tool::Line|Tool::Circle|Tool::Origin)=>CursorIcon::Crosshair,
         (_,Tool::Select)=>{
-          let on_handle=selected.len()==1&&pointer.and_then(|p|project.shapes.get(selected[0]).and_then(|s|self.handle_at(rect,s,p))).is_some();
+          let on_marker=pointer.is_some_and(|p|self.near(rect,project.origin,p,HANDLE_PX+4.0)||self.near(rect,Self::fence_corner(project),p,HANDLE_PX+3.0));
+          let on_handle=on_marker||selected.len()==1&&pointer.and_then(|p|project.shapes.get(selected[0]).and_then(|s|self.handle_at(rect,s,p))).is_some();
           if on_handle{CursorIcon::Crosshair}else if world.and_then(|w|self.hit(project,w)).is_some(){CursorIcon::PointingHand}else{CursorIcon::Default}
         }
       };
@@ -405,20 +439,41 @@ impl CanvasView{
     let o=self.to_screen(rect,0.0,0.0);
     painter.arrow(o,Vec2::new(28.0,0.0),Stroke::new(1.6_f32,Color32::from_rgb(220,80,80)));
     painter.arrow(o,Vec2::new(0.0,-28.0),Stroke::new(1.6_f32,Color32::from_rgb(90,200,110)));
-    // ---- toolpath + simulation ----
-    let mut prev=(0.0,0.0);
+    // ---- work fence (from the origin marker) ----
+    let fr=Rect::from_two_pos(self.to_screen(rect,project.origin.0,project.origin.1),self.to_screen(rect,Self::fence_corner(project).0,Self::fence_corner(project).1));
+    if project.fence.on{
+      painter.rect_filled(fr,0.0,Color32::from_rgba_unmultiplied(240,150,40,14));
+      painter.rect_stroke(fr,0.0,Stroke::new(1.6_f32,C_FENCE),egui::StrokeKind::Middle);
+      painter.text(fr.left_top()+Vec2::new(4.0,-4.0),egui::Align2::LEFT_BOTTOM,format!("fence {} × {} mm",project.fence.w,project.fence.h),egui::FontId::proportional(11.0),C_FENCE);
+    }else{
+      painter.extend(egui::Shape::dashed_line(&[fr.left_top(),fr.right_top(),fr.right_bottom(),fr.left_bottom(),fr.left_top()],Stroke::new(1.0_f32,Color32::from_gray(90)),6.0,5.0));
+    }
+    // ---- toolpath + simulation (plan starts at the origin marker) ----
+    let sim_plan=sim.active&&sim.path.is_none();
+    let mut prev=plan.origin;
     let head=self.to_screen(rect,sim.head.0,sim.head.1);
+    let head_col=if sim.laser{Color32::from_rgb(255,60,50)}else{Color32::YELLOW};
     for (i,m) in plan.moves.iter().enumerate(){
       let (a,b)=(self.to_screen(rect,prev.0,prev.1),self.to_screen(rect,m.x,m.y));
       let base=if m.laser{Color32::from_rgb(105,105,105)}else{Color32::from_rgb(60,66,78)};
-      if sim.active&&i<sim.index{painter.line_segment([a,b],Stroke::new(if m.laser{1.7_f32}else{1.0},Color32::from_rgb(77,211,128)));}
-      else if sim.active&&i==sim.index{painter.line_segment([a,b],Stroke::new(1.2_f32,base));painter.line_segment([a,head],Stroke::new(2.0_f32,Color32::YELLOW));}
+      if sim_plan&&i<sim.index{painter.line_segment([a,b],Stroke::new(if m.laser{1.7_f32}else{1.0},Color32::from_rgb(77,211,128)));}
+      else if sim_plan&&i==sim.index{painter.line_segment([a,b],Stroke::new(1.2_f32,base));painter.line_segment([a,head],Stroke::new(2.0_f32,head_col));}
       else{painter.line_segment([a,b],Stroke::new(if m.laser{1.0_f32}else{0.6},base));}
       prev=(m.x,m.y);
     }
-    if sim.active&&!plan.moves.is_empty(){
-      painter.line_segment([head+Vec2::new(-8.0,-8.0),head+Vec2::new(8.0,8.0)],Stroke::new(2.2_f32,Color32::YELLOW));
-      painter.line_segment([head+Vec2::new(-8.0,8.0),head+Vec2::new(8.0,-8.0)],Stroke::new(2.2_f32,Color32::YELLOW));
+    // ---- live run path (Job or Trace) ----
+    if let (true,Some(path))=(sim.active,&sim.path){
+      let mut prev=sim.start;
+      for (i,m) in path.iter().enumerate(){
+        let (a,b)=(self.to_screen(rect,prev.0,prev.1),self.to_screen(rect,m.x,m.y));
+        if i<sim.index{painter.line_segment([a,b],Stroke::new(if m.laser{1.9_f32}else{1.0},Color32::from_rgb(77,211,128)));}
+        else if i==sim.index{painter.line_segment([a,head],Stroke::new(2.0_f32,head_col));}
+        prev=(m.x,m.y);
+      }
+    }
+    if sim.active&&(!plan.moves.is_empty()||sim.path.is_some()){
+      painter.line_segment([head+Vec2::new(-8.0,-8.0),head+Vec2::new(8.0,8.0)],Stroke::new(2.2_f32,head_col));
+      painter.line_segment([head+Vec2::new(-8.0,8.0),head+Vec2::new(8.0,-8.0)],Stroke::new(2.2_f32,head_col));
     }
     // ---- shapes ----
     let hovered=if matches!(self.drag,Drag::None){world.and_then(|w|self.hit(project,w))}else{None};
@@ -431,6 +486,18 @@ impl CanvasView{
       let (dx,dy)=(c.0-base.0,c.1-base.1);
       for &i in selected.iter(){if let Some(s)=project.shapes.get(i){self.paint_shape(&painter,rect,s,dx,dy,Stroke::new(1.2_f32,C_PREVIEW));}}
       painter.line_segment([self.to_screen(rect,base.0,base.1),self.to_screen(rect,c.0,c.1)],Stroke::new(1.0_f32,C_PREVIEW));
+    }
+    // ---- job origin marker ----
+    let o=self.to_screen(rect,project.origin.0,project.origin.1);
+    painter.line_segment([o-Vec2::new(14.0,0.0),o+Vec2::new(14.0,0.0)],Stroke::new(1.6_f32,C_ORIGIN));
+    painter.line_segment([o-Vec2::new(0.0,14.0),o+Vec2::new(0.0,14.0)],Stroke::new(1.6_f32,C_ORIGIN));
+    painter.circle_stroke(o,6.0,Stroke::new(1.6_f32,C_ORIGIN));
+    painter.text(o+Vec2::new(9.0,9.0),egui::Align2::LEFT_TOP,"0,0 job",egui::FontId::proportional(11.0),C_ORIGIN);
+    // ---- fence resize handle (Select tool) ----
+    if self.tool==Tool::Select{
+      let q=fr.right_top();let r=Rect::from_center_size(q,Vec2::splat(HANDLE_PX*2.0));
+      let col=if project.fence.on{C_FENCE}else{Color32::from_gray(120)};
+      painter.rect_filled(r,1.0,Color32::from_rgb(16,22,30));painter.rect_stroke(r,1.0,Stroke::new(1.2_f32,col),egui::StrokeKind::Inside);
     }
     // ---- handles ----
     if self.tool==Tool::Select&&selected.len()==1{if let Some(s)=project.shapes.get(selected[0]){
@@ -479,6 +546,7 @@ impl CanvasView{
       Tool::Select=>"Click: select · Shift+click: add/remove · Drag empty: box select (rightward = window, leftward = crossing) · Drag shape: move · Drag handle: resize",
       Tool::Pan=>"Drag to pan",
       Tool::Move=>if selected.is_empty(){"Click a shape to select it"}else if self.move_base.is_none(){"Click base point"}else{"Click destination"},
+      Tool::Origin=>"Click to place the job origin (job 0,0). The program runs relative to it.",
       Tool::Rectangle=>if self.draw_start.is_none(){"Click first corner"}else{"Click opposite corner"},
       Tool::Line=>if self.draw_start.is_none(){"Click start point"}else{"Click end point"},
       Tool::Circle=>if self.draw_start.is_none(){"Click centre"}else{"Click radius point"},
@@ -493,6 +561,9 @@ impl CanvasView{
       ui.weak(format!("Grid {} mm",self.grid_spacing));
       ui.weak(format!("Snap {}",if self.snap{"ON"}else{"OFF"}));
       ui.separator();
+      ui.colored_label(C_ORIGIN,format!("Origin X {:.3} Y {:.3}",project.origin.0,project.origin.1));
+      ui.weak(if project.fence.on{format!("Fence ON {} × {}",project.fence.w,project.fence.h)}else{"Fence OFF".to_string()});
+      ui.separator();
       ui.strong(format!("{:?}",self.tool));
       ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate());
     });
@@ -502,5 +573,5 @@ impl CanvasView{
 // =============================================================================
 // End of file: canvas.rs
 // Location:    laser-cnc-controller/src/canvas.rs
-// Created:     2026-10-12 22:40:08 UTC
+// Created:     2026-10-13 18:25:33 UTC
 // =============================================================================

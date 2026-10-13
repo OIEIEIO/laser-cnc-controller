@@ -1,18 +1,22 @@
 // =============================================================================
 // File:     runlog.rs
 // Location: laser-cnc-controller/src/runlog.rs
-// Version:  v0.1.0
+// Version:  v0.1.2
 // Comments: Burn records, daily machine log and G-code export.
 //           Data folder (visible): ~/LaserCNC  (Windows: %USERPROFILE%\LaserCNC)
 //             override with LASER_CNC_HOME=/path
 //             exports/  <project>_<YYYY-MM-DD_HHMM>.gcode   (Export G-code)
-//             runs/     <project>_<YYYY-MM-DD_HHMMSS>/       (one per Job/Frame run)
+//             runs/     <project>_<YYYY-MM-DD_HHMMSS>/       (one per Job/Trace run)
 //                         program.gcode  exact lines streamed
 //                         run.json       run record (outcome, timing, events, settings, notes)
 //                         project.json   project snapshot at run start
 //                         serial.log     TX/RX for this run
 //                         images/        reserved for inspection captures
 //             logs/     YYYY-MM-DD.log  every command sent + controller messages
+//           v0.1.1: run kind "Trace" replaces "Frame" (folder suffix _trace);
+//           older "Frame" records keep their names.
+//           v0.1.2: `simulated` flag (Simulate mode runs, tagged SIM; folder
+//           suffix _sim).
 // =============================================================================
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -79,7 +83,7 @@ pub struct RunEvent { pub time: String, pub event: String }
 pub struct RunRecord {
     pub id: String,
     pub folder: String,
-    pub kind: String,            // "Job" | "Frame"
+    pub kind: String,            // "Job" | "Trace" (older records: "Frame")
     pub project_id: String,
     pub project_name: String,
     pub started: String,         // local "YYYY-MM-DD HH:MM:SS"
@@ -98,9 +102,10 @@ pub struct RunRecord {
     pub app_version: String,
     pub max_power: u32,
     pub spot_power: u32,
-    pub frame_feed: f32,
+    pub frame_feed: f32,         // trace feed (field name kept for older records)
     pub settings: Option<Project>, // geometry and per-shape process settings at run start
     pub notes: String,
+    pub simulated: bool,         // Simulate mode run (virtual controller), shown as SIM
 }
 
 /// Rewrite run.json in the run folder (used at start, end and on notes edits).
@@ -123,7 +128,8 @@ impl ActiveRun {
     pub fn begin(mut record: RunRecord, program: &[String], project: &Project) -> Result<Self, String> {
         let stamp = Local::now().format("%Y-%m-%d_%H%M%S").to_string();
         let mut id = format!("{}_{}", safe_name(&record.project_name), stamp);
-        if record.kind == "Frame" { id.push_str("_frame"); }
+        if record.kind == "Trace" { id.push_str("_trace"); }
+        if record.simulated { id.push_str("_sim"); }
         let folder = runs_dir().join(&id);
         std::fs::create_dir_all(folder.join("images")).map_err(|e| e.to_string())?;
         let mut prog = program.join("\n"); prog.push('\n');
@@ -156,5 +162,5 @@ impl ActiveRun {
 // =============================================================================
 // End of file: runlog.rs
 // Location:    laser-cnc-controller/src/runlog.rs
-// Created:     2026-10-12 22:40:08 UTC
+// Created:     2026-10-13 17:54:31 UTC
 // =============================================================================

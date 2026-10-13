@@ -1,15 +1,28 @@
 // =============================================================================
 // File:     gcode.rs
 // Location: laser-cnc-controller/src/gcode.rs
-// Version:  v0.1.0
+// Version:  v0.1.1
 // Comments: 2D toolpath creation, GRBL 0.9i G-code generation (M3 S / M5 laser
-//           control) and constant-speed time estimate. Logic unchanged.
+//           control) and constant-speed time estimate.
+//           v0.1.1:
+//           - Program coordinates are relative to the job origin marker
+//             (Project::origin): G-code X/Y = canvas X/Y - origin. `moves`
+//             stay in canvas coordinates for drawing and simulation; the
+//             toolpath starts at the origin (Plan::origin).
+//           - The per-shape "outside machine work area" check (canvas 0..work)
+//             is replaced by two job checks on the relative coordinates of
+//             every move (burn and travel), including the 0,0 start point:
+//               * span larger than the machine travel (work_x by work_y);
+//               * work fence ON: any move outside 0..fence.w by 0..fence.h.
+//           - Negative zero is written as 0.000.
 // =============================================================================
 use crate::geometry::{Fill, Operation, Project, Shape, ShapeKind};
 #[derive(Clone, Copy, Debug)]
 pub struct Move { pub x:f32, pub y:f32, pub feed:f32, pub power:u32, pub laser:bool }
 #[derive(Default)]
-pub struct Plan { pub moves:Vec<Move>, pub lines:Vec<String>, pub move_lines:Vec<usize>, pub engraving_mm:f32, pub travel_mm:f32, pub estimated_seconds:f32, pub warnings:Vec<String> }
+pub struct Plan { pub moves:Vec<Move>, pub lines:Vec<String>, pub move_lines:Vec<usize>, pub engraving_mm:f32, pub travel_mm:f32, pub estimated_seconds:f32, pub warnings:Vec<String>, pub origin:(f32,f32) }
+
+const EPS:f32=0.001;
 
 fn add(plan:&mut Plan, x:f32,y:f32,feed:f32,power:u32,laser:bool, cursor:&mut (f32,f32),travel:f32) {
     let distance = ((x-cursor.0).powi(2)+(y-cursor.1).powi(2)).sqrt();
@@ -66,13 +79,31 @@ fn outline(plan:&mut Plan,s:&Shape,cursor:&mut (f32,f32),travel:f32) {
         }
     }
 }
+/// Coordinate as written to G-code: no negative zero.
+pub fn coord(v:f32)->f32{if v.abs()<0.0005{0.0}else{v}}
+
+/// Relative extent (x0,y0,x1,y1) of a set of canvas points, including the 0,0 start.
+pub fn relative_span(points:&[(f32,f32)],origin:(f32,f32))->(f32,f32,f32,f32){
+    let (mut x0,mut y0,mut x1,mut y1)=(0.0f32,0.0f32,0.0f32,0.0f32);
+    for p in points{let (x,y)=(p.0-origin.0,p.1-origin.1);x0=x0.min(x);y0=y0.min(y);x1=x1.max(x);y1=y1.max(y);}
+    (x0,y0,x1,y1)
+}
+/// Machine-travel and work-fence checks on relative coordinates. Empty when the job may run.
+pub fn limit_warnings(p:&Project,span:(f32,f32,f32,f32),what:&str)->Vec<String>{
+    let (x0,y0,x1,y1)=span;let mut out=vec![];
+    if x1-x0>p.work_x+EPS||y1-y0>p.work_y+EPS{
+        out.push(format!("{what} spans {:.1} × {:.1} mm from the job origin, larger than the machine travel {} × {} mm",x1-x0,y1-y0,p.work_x,p.work_y));
+    }
+    if p.fence.on&&(x0< -EPS||y0< -EPS||x1>p.fence.w+EPS||y1>p.fence.h+EPS){
+        out.push(format!("{what} leaves the work fence (0–{:.1} × 0–{:.1} mm): X {:.2} … {:.2}, Y {:.2} … {:.2}",p.fence.w,p.fence.h,x0,x1,y0,y1));
+    }
+    out
+}
 pub fn generate(p:&Project, max_power:u32)->Plan {
-    let mut plan=Plan::default();
-    let mut cursor=(0.0,0.0);
+    let mut plan=Plan{origin:p.origin,..Plan::default()};
+    let mut cursor=p.origin;
     let travel=p.travel_feed.max(1.0);
     for (idx,s) in p.shapes.iter().enumerate() {
-        let (x0,y0,x1,y1)=s.extent();
-        if x0<0.0||y0<0.0||x1>p.work_x||y1>p.work_y {plan.warnings.push(format!("Shape {} is outside machine work area",idx+1));continue;}
         if s.feed<=0.0||s.lines_per_mm<=0.0||s.passes==0||s.power>max_power {plan.warnings.push(format!("Shape {} has invalid process settings",idx+1));continue;}
         for _ in 0..s.passes.min(100) {
             if s.operation != Operation::Fill {outline(&mut plan,s,&mut cursor,travel);}
@@ -82,16 +113,21 @@ pub fn generate(p:&Project, max_power:u32)->Plan {
             }
         }
     }
+    // Job limits on relative coordinates (every burn and travel move, plus the 0,0 start).
+    let points:Vec<(f32,f32)>=plan.moves.iter().map(|m|(m.x,m.y)).collect();
+    if !points.is_empty(){let w=limit_warnings(p,relative_span(&points,p.origin),"Job");plan.warnings.extend(w);}
     // Explicit M5 before every positioning move. No assumption that G0 extinguishes GRBL 0.9 laser output.
+    let (ox,oy)=p.origin;
     plan.lines.push("G21".into());plan.lines.push("G90".into());plan.lines.push("M5".into());
     let mut last_laser=false; let mut last_power=0u32;
     for m in &plan.moves {
+        let (x,y)=(coord(m.x-ox),coord(m.y-oy));
         if !m.laser {
             if last_laser {plan.lines.push("M5".into()); last_laser=false;}
-            plan.lines.push(format!("G0 X{:.3} Y{:.3}",m.x,m.y));
+            plan.lines.push(format!("G0 X{x:.3} Y{y:.3}"));
         } else {
             if !last_laser||last_power!=m.power {plan.lines.push(format!("M3 S{}",m.power));last_laser=true;last_power=m.power;}
-            plan.lines.push(format!("G1 X{:.3} Y{:.3} F{:.1}",m.x,m.y,m.feed));
+            plan.lines.push(format!("G1 X{x:.3} Y{y:.3} F{:.1}",m.feed));
         }
         plan.move_lines.push(plan.lines.len().saturating_sub(1));
     }
@@ -101,5 +137,5 @@ pub fn generate(p:&Project, max_power:u32)->Plan {
 // =============================================================================
 // End of file: gcode.rs
 // Location:    laser-cnc-controller/src/gcode.rs
-// Created:     2026-10-12 18:37:43 UTC
+// Created:     2026-10-13 17:35:14 UTC
 // =============================================================================

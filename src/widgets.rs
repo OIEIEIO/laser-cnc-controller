@@ -1,12 +1,14 @@
 // =============================================================================
 // File:     widgets.rs
 // Location: laser-cnc-controller/src/widgets.rs
-// Version:  v0.1.0
+// Version:  v0.1.1
 // Comments: Shared UI widgets.
 //           - Numeric spin field: typed entry (commit on Enter / focus loss)
 //             plus ▲▼ step buttons. No drag-to-change, no sliders.
 //           - Painted CAD tool icons and icon buttons (no icon-font
 //             dependency, crisp at any scale).
+//           v0.1.1: Origin (job 0,0 marker tool) and Fence (work fence
+//           on/off) icons.
 // =============================================================================
 use eframe::egui::{self,Align,Color32,CornerRadius,Pos2,Rect,Sense,Stroke,Vec2};
 
@@ -78,7 +80,7 @@ pub fn num_u32(ui:&mut egui::Ui,id_salt:&str,value:&mut u32,step:u32,min:u32,max
 }
 
 #[derive(Clone,Copy,PartialEq)]
-pub enum Icon{Select,Pan,Move,Rectangle,Line,Circle,Duplicate,Delete,Clear,Grid,Snap,Fit}
+pub enum Icon{Select,Pan,Move,Origin,Rectangle,Line,Circle,Duplicate,Delete,Clear,Grid,Snap,Fit,Fence}
 
 /// Square icon button. `selected` draws it in the accent (active tool / toggle on).
 pub fn icon_button(ui:&mut egui::Ui,icon:Icon,selected:bool,enabled:bool,tip:&str)->egui::Response{
@@ -114,6 +116,16 @@ fn paint_icon(p:&egui::Painter,r:Rect,icon:Icon,c:Color32){
       p.extend(egui::Shape::dashed_line(&[a.left_top(),a.right_top(),a.right_bottom(),a.left_bottom(),a.left_top()],Stroke::new(1.2_f32,c),2.5,2.0));
       p.rect_stroke(Rect::from_min_max(at(0.58,0.03),at(1.0,0.45)),0.0,s,egui::StrokeKind::Inside);
       p.line_segment([at(0.30,0.67),at(0.62,0.38)],s);arrow_head(at(0.68,0.32),Vec2::new(1.0,-0.9));
+    }
+    Icon::Origin=>{
+      let c0=r.center();
+      p.line_segment([at(0.0,0.5),at(1.0,0.5)],s);p.line_segment([at(0.5,0.0),at(0.5,1.0)],s);
+      p.circle_stroke(c0,r.width()*0.30,s);
+    }
+    Icon::Fence=>{
+      let a=Rect::from_min_max(at(0.0,0.08),at(1.0,0.92));
+      p.extend(egui::Shape::dashed_line(&[a.left_top(),a.right_top(),a.right_bottom(),a.left_bottom(),a.left_top()],Stroke::new(1.4_f32,c),3.0,2.0));
+      p.circle_filled(a.left_bottom(),2.6,c);p.rect_filled(Rect::from_center_size(a.right_top(),Vec2::splat(4.5)),0.0,c);
     }
     Icon::Rectangle=>{p.rect_stroke(Rect::from_min_max(at(0.0,0.18),at(1.0,0.82)),0.0,s,egui::StrokeKind::Inside);}
     Icon::Line=>{p.line_segment([at(0.08,0.92),at(0.92,0.08)],s);p.circle_filled(at(0.08,0.92),2.4,c);p.circle_filled(at(0.92,0.08),2.4,c);}
@@ -152,5 +164,5 @@ fn paint_icon(p:&egui::Painter,r:Rect,icon:Icon,c:Color32){
 // =============================================================================
 // End of file: widgets.rs
 // Location:    laser-cnc-controller/src/widgets.rs
-// Created:     2026-10-12 20:50:22 UTC
+// Created:     2026-10-13 17:35:14 UTC
 // =============================================================================

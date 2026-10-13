@@ -1,26 +1,19 @@
 // =============================================================================
 // File:     app.rs
 // Location: laser-cnc-controller/src/app.rs
-// Version:  v0.1.5
+// Version:  v0.1.9
 // Comments: Application shell: theme, panels, machine-control row, project
 //           management, run recording, simulation timing, G-code monitor.
 //           - Fixed machine-control row under the File/Help line, in job order:
-//             Spot ON [power], Frame [feed] | Start, Pause/Resume, Reset |
-//             Laser ON [power], Laser OFF.
-//           - Spot ON: M3 S<spot>; Laser ON: M3 S<laser> (default S150);
-//             Laser OFF: M5; Reset: feed hold (!) then soft reset (Ctrl-X).
+//             Spot ON/OFF [power], Trace [Part|Job|Fence] [feed] | Start,
+//             Pause/Resume, Reset | Laser OFF   (v0.1.6 layout).
+//           - Reset: feed hold (!) then soft reset (Ctrl-X).
 //           - Pause/Resume is one button driven by the GRBL state word:
 //             Run -> "Pause" sends '@' (safety door: hold position, laser off);
 //             Door/Hold -> "Resume" sends '~' (GRBL restores laser, then moves).
 //             A DOOR flag shows while the controller reports Door.
-//           - Frame traces the geometry bounding box at spot power and frame
-//             feed (M5, G0 to corner, M3 S<spot>, G1 perimeter, M5).
 //           - Canvas, tools, grid/snap/zoom live in src/canvas.rs.
-//           - Shape Properties docks into the canvas tool strip (hidden there);
-//             it floats automatically when a newly selected shape appears while
-//             docked, and stays open (blank) when nothing is selected.
-//           - Simulation (right column): Start (from the beginning),
-//             Pause/Resume toggle, Reset; 1×/2×/5×/10×/50× speed.
+//           - Shape Properties: right column, top (v0.1.8).
 //           - G-code / Stream: compact monospace, per-line state, follows the
 //             active line, controller state, filtered RX/TX log.
 //           - No sliders or drag-to-change fields (src/widgets.rs spin fields).
@@ -54,12 +47,61 @@
 //             error and the count. ALARM ends the run as "Error".
 //           - Fixed 1.15 pixels-per-point removed (OS scaling; egui
 //             Ctrl+Plus / Ctrl+Minus zoom).
+//           v0.1.6:
+//           - Zero X / Zero Y send G92 X0 / G92 Y0 (GRBL here rejects G10 L20).
+//             Go to zero sits on the same row.
+//           - Jog step: 0.1 / 1 / 10 mm buttons plus a typed step field.
+//           - Job origin marker and work fence (src/canvas.rs, src/gcode.rs):
+//             the program runs relative to the marker.
+//           - Jogs outside the work fence are refused (pop-up) while the fence
+//             is ON and the axis has been zeroed this session. Base position:
+//             reported WPos, or the last commanded jog target while moving.
+//           - Spot ON / Spot OFF: one latching button (M3 S<spot> / M5).
+//             Laser ON and its power field removed; Laser OFF stays (M5, also
+//             clears Spot). Spot clears on Laser OFF, job/trace start, Reset,
+//             disconnect, alarm or any controller reset (banner).
+//           - Frame replaced by Trace with target Part (selection box) / Job
+//             (all shapes box) / Fence, relative to the origin marker, at spot
+//             power and trace feed. Run kind "Trace".
+//           - Live run view: during a Job or Trace the canvas shows the run's
+//             path with done / current segment and the head at origin + WPos
+//             (smoothed). Progress follows the reported position along the
+//             path (GRBL 0.9 does not report the executing line).
+//           - Floating G-code / Stream window: background 80 % transparent.
+//           - Work zero flags clear on any controller reset or disconnect.
+//           v0.1.7:
+//           - Simulation panel and offline simulation removed.
+//           - Simulate toggle + speed (1/2/5/10/50x) in the machine-control row
+//             after Laser OFF. Switchable only while disconnected. Connect then
+//             attaches the virtual GRBL (src/vgrbl.rs): every button, the
+//             stream view and the live run view work as on the machine.
+//             SIMULATION badge in the control row; Serial panel shows
+//             SIMULATOR. Speed changes apply during a run.
+//           - Run records tagged SIM (RunRecord::simulated) in Runs, Run
+//             History and the daily log.
+//           - Head marker red while the laser is on, yellow while off: from
+//             the virtual controller in Simulate, otherwise from the path
+//             segment the head is on (burn or travel).
+//           - Panels: 7 (layout key v4; floating flags reset once).
+//           v0.1.8:
+//           - Shape Properties docks at the top of the right column (above Jog
+//             Controls) as a normal collapsible / floatable panel; it expands
+//             when a new shape is selected. Tool-strip slot removed.
+//           - Jog step buttons: 0.1 mm and 10 mm, plus the typed step field.
+//           - Stream header counts clamp at zero (after Reset / Disconnect the
+//             sent counter returned to 0 while OK did not, and Sent wrapped).
+//           v0.1.9:
+//           - Machine Profile (Work X / Y, Travel F, Max PWM S) is a user
+//             setting saved with the app settings (eframe storage), restored
+//             at startup and applied to every project (new, opened, closed).
+//             Defaults 380 x 280 mm, 2500 mm/min, S1000. Profile values are
+//             left out of the unsaved-changes comparison.
 // =============================================================================
 use eframe::egui::{self,Color32,CornerRadius,Stroke,Vec2};
 use eframe::egui::collapsing_header::CollapsingState;
 use serde::{Deserialize,Serialize};
 use crate::geometry::{self,Project,ShapeKind,Fill,Operation};
-use crate::gcode::{self,Plan};
+use crate::gcode::{self,Move,Plan};
 use crate::storage::Store;
 use crate::machine::{Link,Machine};
 use crate::canvas::{CanvasView,SimOverlay};
@@ -70,12 +112,27 @@ use std::time::Instant;
 #[derive(Clone,Copy,Default,Serialize,Deserialize)]
 struct Panel { floating:bool }
 
-const TITLES:[&str;8]=["Serial Communications","Projects","Shape Properties","Machine Profile","Jog Controls","G-code / Stream","Simulation","Runs"];
-const LEFT_DOCK:[usize;4]=[0,1,3,7];
-const RIGHT_DOCK:[usize;3]=[4,5,6];
+const TITLES:[&str;7]=["Serial Communications","Projects","Shape Properties","Machine Profile","Jog Controls","G-code / Stream","Runs"];
+const LEFT_DOCK:[usize;4]=[0,1,3,6];
+const RIGHT_DOCK:[usize;3]=[2,4,5];
 const PROPS:usize=2;
-const LAYOUT_KEY:&str="panel_layout_v3";
+const LAYOUT_KEY:&str="panel_layout_v4";
+const PROFILE_KEY:&str="machine_profile_v1";
+
+/// Machine Profile: a property of the machine, saved with the app settings.
+#[derive(Clone,Copy,PartialEq,Serialize,Deserialize)]
+#[serde(default)]
+struct MachineProfile{work_x:f32,work_y:f32,travel_feed:f32,max_power:u32}
+impl Default for MachineProfile{fn default()->Self{Self{work_x:380.0,work_y:280.0,travel_feed:2500.0,max_power:1000}}}
 const SIM_SPEEDS:[f32;5]=[1.0,2.0,5.0,10.0,50.0];
+const FENCE_EPS:f32=0.001;
+
+/// Trace target in the machine-control row.
+#[derive(Clone,Copy,PartialEq)]
+enum TraceTarget{Part,Job,Fence}
+
+/// Live view of a Job or Trace run: its path in canvas coordinates and progress along it.
+struct LiveView{path:Vec<Move>,origin:(f32,f32),progress:usize,head:Option<(f32,f32)>}
 
 /// Project action that may need an unsaved-changes prompt first.
 #[derive(Clone,PartialEq)]
@@ -88,18 +145,20 @@ enum Dialog{
   ConfirmOverwrite{name:String,copy:bool,then:Option<Pending>},
   ConfirmDelete{name:String},
   Unsaved{then:Pending},
+  Notice{title:String,msg:String},
 }
 
 pub struct LaserApp {
     project:Project, plan:Plan, store:Option<Store>, machine:Machine,
     view:CanvasView, selected:Vec<usize>, props_last_sel:Vec<usize>,
-    panels:[Panel;8],
-    simulated:bool,sim_position:f32,sim_speed:f32,last_frame:Instant,sim_time:f32,
-    spot_power:u32,frame_feed:f32,laser_power:u32,monitor_follow:usize,
-    max_power:u32, project_active:bool, saved_once:bool, saved_json:String, dirty:bool, last_title:String,
+    panels:[Panel;7],
+    last_frame:Instant,
+    spot_power:u32,frame_feed:f32,spot_on:bool,trace_target:TraceTarget,monitor_follow:usize,
+    max_power:u32, profile:MachineProfile, project_active:bool, saved_once:bool, saved_json:String, dirty:bool, last_title:String,
     dialog:Dialog, saved_names:Vec<String>, project_to_load:String, notice:String, job_lines:Vec<String>,
     runs:Vec<RunRecord>, selected_run:Option<String>, notes_edit:String, active_run:Option<ActiveRun>,
     manual_cmd:String,
+    zero_x:bool, zero_y:bool, seen_resets:u32, live:Option<LiveView>, jog_pred:Option<(f32,f32)>, last_jog:Option<Instant>,
 }
 
 impl LaserApp {
@@ -136,50 +195,46 @@ impl LaserApp {
     cc.egui_ctx.set_style(style);
 
     // ---- Restore floating/docked layout from the last session ----
-    let mut panels=[Panel::default();8];
-    if let Some(storage)=cc.storage {if let Some(saved)=eframe::get_value::<[Panel;8]>(storage,LAYOUT_KEY){panels=saved;}}
+    let mut panels=[Panel::default();7];
+    if let Some(storage)=cc.storage {if let Some(saved)=eframe::get_value::<[Panel;7]>(storage,LAYOUT_KEY){panels=saved;}}
+    // ---- Machine Profile from the user settings (defaults 380 x 280) ----
+    let profile=cc.storage.and_then(|s|eframe::get_value::<MachineProfile>(s,PROFILE_KEY)).unwrap_or_default();
 
     let (store,err)=match Store::open(){Ok(s)=>(Some(s),String::new()),Err(e)=>(None,format!("Database unavailable: {e}"))};
-    let project=Project::blank();
-    let saved_json=serde_json::to_string(&project).unwrap_or_default();
+    let mut project=Project::blank();
+    project.work_x=profile.work_x;project.work_y=profile.work_y;project.travel_feed=profile.travel_feed;
+    let saved_json=Self::comparable_json(&project);
     let (mut names,mut runs)=(vec![],vec![]);
     if let Some(s)=&store {names=s.names().unwrap_or_default();runs=s.runs().unwrap_or_default();}
-    let plan=gcode::generate(&project,1000);
+    let plan=gcode::generate(&project,profile.max_power);
     let mut machine=Machine::default();machine.refresh();
     Self {project,plan,store,machine,view:CanvasView::default(),selected:vec![],props_last_sel:vec![],
       panels,
-      simulated:false,sim_position:0.0,sim_speed:1.0,last_frame:Instant::now(),sim_time:0.0,
-      spot_power:2,frame_feed:1200.0,laser_power:150,monitor_follow:usize::MAX,max_power:1000,
+      last_frame:Instant::now(),
+      spot_power:2,frame_feed:1200.0,spot_on:false,trace_target:TraceTarget::Job,monitor_follow:usize::MAX,max_power:profile.max_power,profile,
       project_active:false,saved_once:false,saved_json,dirty:false,last_title:String::new(),
       dialog:Dialog::None,saved_names:names,project_to_load:String::new(),notice:err,job_lines:vec![],
-      runs,selected_run:None,notes_edit:String::new(),active_run:None,manual_cmd:String::new()}
+      runs,selected_run:None,notes_edit:String::new(),active_run:None,manual_cmd:String::new(),
+      zero_x:false,zero_y:false,seen_resets:0,live:None,jog_pred:None,last_jog:None}
  }
- fn regenerate(&mut self){self.plan=gcode::generate(&self.project,self.max_power);self.simulated=false;self.sim_position=0.0;self.sim_time=0.0;}
+ /// Apply the Machine Profile to the open project, then regenerate the program.
+ fn regenerate(&mut self){
+    self.project.work_x=self.profile.work_x;self.project.work_y=self.profile.work_y;self.project.travel_feed=self.profile.travel_feed;
+    self.max_power=self.profile.max_power;
+    self.plan=gcode::generate(&self.project,self.max_power);
+ }
+ /// Project JSON without the Machine Profile fields (those belong to the machine, not the project).
+ fn comparable_json(p:&Project)->String{
+    let mut c=p.clone();c.work_x=0.0;c.work_y=0.0;c.travel_feed=0.0;
+    serde_json::to_string(&c).unwrap_or_default()
+ }
  fn duration_hms(seconds:f32)->String {let t=seconds.max(0.0).ceil() as u64; format!("{:02}:{:02}:{:02}",t/3600,(t/60)%60,t%60)}
- fn simulated_cursor(&self)->(usize,f32,(f32,f32)) {
-    let mut elapsed=0.0f32; let mut prev=(0.0,0.0);
-    for (i,m) in self.plan.moves.iter().enumerate(){
-       let distance=((m.x-prev.0).powi(2)+(m.y-prev.1).powi(2)).sqrt();
-       let duration=distance/m.feed.max(1.0)*60.0;
-       if self.sim_time < elapsed+duration && duration>0.000001 {
-           let fraction=((self.sim_time-elapsed)/duration).clamp(0.0,1.0);
-           return (i,fraction,(prev.0+(m.x-prev.0)*fraction,prev.1+(m.y-prev.1)*fraction));
-       }
-       elapsed+=duration;prev=(m.x,m.y);
-    }
-    (self.plan.moves.len(),1.0,prev)
- }
- fn sim_line(&self)->usize {
-    let (idx,_,_)=self.simulated_cursor();
-    if idx>=self.plan.move_lines.len(){self.plan.lines.len()}
-    else {self.plan.move_lines[idx]}
- }
  fn action(ui:&mut egui::Ui,label:&str,color:Color32)->egui::Response {
     ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE).strong()).fill(color).min_size(Vec2::new(88.0,30.0)))
  }
 
  // ======================================================================== projects
- fn mark_clean(&mut self){self.saved_json=serde_json::to_string(&self.project).unwrap_or_default();}
+ fn mark_clean(&mut self){self.saved_json=Self::comparable_json(&self.project);}
  fn refresh_names(&mut self){if let Some(s)=&self.store{self.saved_names=s.names().unwrap_or_default();}}
  /// Write the open project under its current name.
  fn save(&mut self){
@@ -260,20 +315,24 @@ impl LaserApp {
 
  // ======================================================================== runs
  fn refresh_runs(&mut self){if let Some(s)=&self.store{self.runs=s.runs().unwrap_or_default();}}
- /// Stream `lines` and open a run record for it.
- fn begin_run(&mut self,kind:&str,lines:Vec<String>){
+ /// Stream `lines` and open a run record for it. `path` (canvas coordinates) drives the live view.
+ fn begin_run(&mut self,kind:&str,lines:Vec<String>,path:Vec<Move>){
     if self.active_run.is_some()||self.machine.running {self.notice="A run is already in progress".into();return;}
     self.job_lines=lines;
     self.machine.start(&self.job_lines);
     if !self.machine.running {return;}
+    // Every program starts with M5.
+    self.spot_on=false;
+    self.live=Some(LiveView{path,origin:self.project.origin,progress:0,head:None});
     let record=RunRecord{kind:kind.into(),project_id:self.project.id.clone(),project_name:self.project.name.clone(),
       estimate_s:if kind=="Job"{self.plan.estimated_seconds}else{0.0},
-      port:self.machine.selected_port.clone(),baud:self.machine.baud,firmware:self.machine.firmware.clone(),
+      port:self.machine.port_label(),baud:self.machine.baud,firmware:self.machine.firmware.clone(),simulated:self.machine.simulate,
       app_version:env!("CARGO_PKG_VERSION").into(),max_power:self.max_power,spot_power:self.spot_power,frame_feed:self.frame_feed,
       ..Default::default()};
     match ActiveRun::begin(record,&self.job_lines,&self.project){
       Ok(run)=>{
-        let _=runlog::append_daily(&[format!("{} RUN START {} {} ({} lines) -> {}",runlog::clock(),kind,run.record.project_name,self.job_lines.len(),run.record.folder)]);
+        let tag=if run.record.simulated{"SIM "}else{""};
+        let _=runlog::append_daily(&[format!("{} RUN START {tag}{} {} ({} lines) -> {}",runlog::clock(),kind,run.record.project_name,self.job_lines.len(),run.record.folder)]);
         if let Some(s)=&self.store{let _=s.save_run(&run.record);}
         self.active_run=Some(run);
       }
@@ -306,30 +365,114 @@ impl LaserApp {
       } else {None};
     let Some(outcome)=outcome else {return;};
     let run=self.active_run.take().unwrap();
+    self.live=None;
     // Alarm text, or the first line error with the total count (streaming continued past line errors).
     let error=if outcome=="Error"{
       self.machine.alarm.clone().or_else(||self.machine.job_error.as_ref().map(|e|format!("{e} ({} line error(s))",self.machine.job_errors)))
     }else{None};
     let record=run.finish(outcome,error,self.machine.error_line,self.machine.acknowledged.min(total));
-    let _=runlog::append_daily(&[format!("{} RUN END {} {} — {} ({})",runlog::clock(),record.kind,record.project_name,record.outcome,Self::duration_hms(record.duration_s))]);
+    let tag=if record.simulated{"SIM "}else{""};
+    let _=runlog::append_daily(&[format!("{} RUN END {tag}{} {} — {} ({})",runlog::clock(),record.kind,record.project_name,record.outcome,Self::duration_hms(record.duration_s))]);
     if let Some(s)=&self.store{let _=s.save_run(&record);}
-    self.notice=format!("{} run {}: {}",record.kind,record.outcome.to_lowercase(),record.id);
+    self.notice=format!("{}{} run {}: {}",if record.simulated{"SIM "}else{""},record.kind,record.outcome.to_lowercase(),record.id);
     self.refresh_runs();
  }
 
- fn frame_commands(&self)->Vec<String>{
-    // Trace the geometry bounding box with the beam at spot power.
-    let mut x0=f32::MAX;let mut y0=f32::MAX;let mut x1=f32::MIN;let mut y1=f32::MIN;
-    for s in &self.project.shapes {let (a,b,c,d)=s.extent();x0=x0.min(a);y0=y0.min(b);x1=x1.max(c);y1=y1.max(d);}
-    if x0==f32::MAX||x0<0.0||y0<0.0||x1>self.project.work_x||y1>self.project.work_y{return vec![];}
-    vec!["M5".into(),"G21".into(),"G90".into(),format!("G0 X{x0:.3} Y{y0:.3}"),format!("M3 S{}",self.spot_power),
-    format!("G1 X{x1:.3} Y{y0:.3} F{:.1}",self.frame_feed),format!("G1 X{x1:.3} Y{y1:.3}"),
-    format!("G1 X{x0:.3} Y{y1:.3}"),format!("G1 X{x0:.3} Y{y0:.3}"),"M5".into()]
+ /// Trace rectangle (canvas coordinates) for the selected target.
+ fn trace_rect(&self)->Result<(f32,f32,f32,f32),String>{
+    let bbox=|idx:&mut dyn Iterator<Item=usize>|{
+      let mut r=(f32::MAX,f32::MAX,f32::MIN,f32::MIN);
+      for i in idx{if let Some(s)=self.project.shapes.get(i){let (a,b,c,d)=s.extent();r=(r.0.min(a),r.1.min(b),r.2.max(c),r.3.max(d));}}
+      if r.0==f32::MAX{None}else{Some(r)}
+    };
+    match self.trace_target{
+      TraceTarget::Part=>bbox(&mut self.selected.iter().copied()).ok_or_else(||"Select a part on the canvas to trace it".to_string()),
+      TraceTarget::Job=>bbox(&mut (0..self.project.shapes.len())).ok_or_else(||"Nothing to trace: the canvas has no shapes".to_string()),
+      TraceTarget::Fence=>{
+        if !self.project.fence.on{return Err("Turn the work fence on to trace it".into());}
+        let (ox,oy)=self.project.origin;Ok((ox,oy,ox+self.project.fence.w,oy+self.project.fence.h))
+      }
+    }
  }
+ /// Trace program (relative to the origin marker) and its path in canvas coordinates.
+ fn trace_program(&self)->Result<(Vec<String>,Vec<Move>),String>{
+    let (x0,y0,x1,y1)=self.trace_rect()?;
+    let corners=[(x0,y0),(x1,y0),(x1,y1),(x0,y1),(x0,y0)];
+    let warnings=gcode::limit_warnings(&self.project,gcode::relative_span(&corners,self.project.origin),"Trace");
+    if let Some(w)=warnings.first(){return Err(w.clone());}
+    let (ox,oy)=self.project.origin;
+    let c=|v:f32|gcode::coord(v);
+    let mut lines=vec!["M5".to_string(),"G21".into(),"G90".into(),format!("G0 X{:.3} Y{:.3}",c(x0-ox),c(y0-oy)),format!("M3 S{}",self.spot_power)];
+    let mut path=vec![Move{x:x0,y:y0,feed:self.project.travel_feed,power:0,laser:false}];
+    for (i,(x,y)) in corners.iter().skip(1).enumerate(){
+      lines.push(if i==0{format!("G1 X{:.3} Y{:.3} F{:.1}",c(x-ox),c(y-oy),self.frame_feed)}else{format!("G1 X{:.3} Y{:.3}",c(x-ox),c(y-oy))});
+      path.push(Move{x:*x,y:*y,feed:self.frame_feed,power:self.spot_power,laser:true});
+    }
+    lines.push("M5".into());
+    Ok((lines,path))
+ }
+ fn notice_dialog(&mut self,title:&str,msg:String){self.dialog=Dialog::Notice{title:title.into(),msg};}
  fn jog(&mut self,dx:f32,dy:f32){
     if !self.machine.connected(){self.notice="No controller connected".into();return;}
-    // GRBL 0.9 has no $J command; single incremental moves, restoration after each acknowledgement.
+    if self.machine.running{self.notice="Jog is unavailable while a program streams".into();return;}
+    // Base position: reported WPos once the controller is idle after the last jog; otherwise the last commanded target.
+    let settled=self.machine.state.starts_with("Idle")&&self.last_jog.map_or(true,|t|t.elapsed().as_millis()>400);
+    let wpos=self.machine.info.wpos.map(|w|(w.0,w.1));
+    let base=if settled{wpos}else{self.jog_pred.or(wpos)};
+    let f=self.project.fence;
+    if f.on&&(self.zero_x||self.zero_y){
+      let Some(b)=base else {
+        self.notice_dialog("Jog refused","The controller is not reporting a work position (WPos), so the move cannot be checked against the work fence.\n\nTurn the work fence off to jog.".into());
+        return;
+      };
+      let t=(b.0+dx,b.1+dy);
+      let out_x=self.zero_x&&(t.0< -FENCE_EPS||t.0>f.w+FENCE_EPS);
+      let out_y=self.zero_y&&(t.1< -FENCE_EPS||t.1>f.h+FENCE_EPS);
+      if out_x||out_y{
+        self.notice_dialog("Jog refused",format!("This move would take the head to X {:.3}  Y {:.3}, outside the work fence (0 – {:.1} × 0 – {:.1} mm from the job zero).\n\nEnlarge the work fence, turn it off, or jog the other way.",t.0,t.1,f.w,f.h));
+        return;
+      }
+    }
+    self.jog_pred=base.map(|b|(b.0+dx,b.1+dy));
+    self.last_jog=Some(Instant::now());
+    // GRBL 0.9 has no $J command: incremental G91 move, then G90.
     self.machine.jog(dx,dy);
+ }
+ /// Spot ON / Spot OFF latching button.
+ fn toggle_spot(&mut self){
+    if !self.machine.connected(){self.notice="No controller connected".into();return;}
+    if self.machine.running{self.notice="Spot is unavailable while a program streams".into();return;}
+    if self.spot_on{self.machine.command("M5");self.spot_on=false;}
+    else{self.machine.command(&format!("M3 S{}",self.spot_power));self.spot_on=true;}
+ }
+ fn laser_off(&mut self){
+    if !self.machine.connected(){self.notice="No controller connected".into();return;}
+    self.machine.command("M5");
+    if !self.machine.running{self.spot_on=false;}
+ }
+ /// Session state a manual command changes (work zero, spot).
+ fn note_manual(&mut self,cmd:&str){
+    let c=cmd.to_ascii_uppercase().replace(' ',"");
+    if c.contains("G92")&&!c.contains("G92.1"){if c.contains('X'){self.zero_x=true;}if c.contains('Y'){self.zero_y=true;}}
+    if c.contains("M5"){self.spot_on=false;}
+    else if c.contains("M3")||c.contains("M4"){self.spot_on=true;}
+ }
+ /// Head position and progress along the live run's path.
+ fn update_live(&mut self,dt:f32){
+    let Some(lv)=&mut self.live else {return;};
+    let Some(w)=self.machine.info.wpos else {return;};
+    let target=(lv.origin.0+w.0,lv.origin.1+w.1);
+    let a=1.0-(-dt*12.0).exp();
+    lv.head=Some(match lv.head{None=>target,Some(h)=>(h.0+(target.0-h.0)*a,h.1+(target.1-h.1)*a)});
+    // Nearest segment within a forward window; earliest one within 0.02 mm of the best (adjacent raster lines).
+    let end=(lv.progress+300).min(lv.path.len());
+    let mut dists=Vec::with_capacity(end.saturating_sub(lv.progress));
+    for i in lv.progress..end{
+      let p0=if i==0{lv.origin}else{(lv.path[i-1].x,lv.path[i-1].y)};
+      dists.push(seg_dist(target,p0,(lv.path[i].x,lv.path[i].y)));
+    }
+    let best=dists.iter().cloned().fold(f32::MAX,f32::min);
+    if best<1.0{if let Some(k)=dists.iter().position(|&d|d<=best+0.02){lv.progress+=k;}}
  }
 
  // ======================================================================== panels
@@ -448,10 +591,10 @@ impl LaserApp {
    // ---- run history for this project ----
    ui.separator();ui.strong("Run History");
    let mine:Vec<(String,String)>=self.runs.iter().filter(|r|r.project_id==self.project.id)
-     .map(|r|(r.id.clone(),format!("{} {:<5} {:<9} {}",r.started.get(5..16).unwrap_or(&r.started),r.kind,r.outcome,Self::duration_hms(r.duration_s)))).collect();
+     .map(|r|(r.id.clone(),format!("{} {:<5} {:<3} {:<9} {}",r.started.get(5..16).unwrap_or(&r.started),r.kind,if r.simulated{"SIM"}else{""},r.outcome,Self::duration_hms(r.duration_s)))).collect();
    let jobs=self.runs.iter().filter(|r|r.project_id==self.project.id&&r.kind=="Job").count();
    if mine.is_empty(){ui.weak("No runs yet.");return;}
-   ui.label(format!("Runs: {} (Jobs {} · Frames {})",mine.len(),jobs,mine.len()-jobs));
+   ui.label(format!("Runs: {} (Jobs {} · Traces {})",mine.len(),jobs,mine.len()-jobs));
    ui.label(format!("Last: {}",self.runs.iter().find(|r|r.project_id==self.project.id).map(|r|r.started.clone()).unwrap_or_default()));
    let mut clicked=None;
    egui::ScrollArea::vertical().id_salt("run_history").max_height(160.0).show(ui,|ui|{
@@ -459,7 +602,7 @@ impl LaserApp {
        if ui.add(egui::Button::new(egui::RichText::new(text).monospace().size(11.0)).selected(self.selected_run.as_ref()==Some(id)).frame(self.selected_run.as_ref()==Some(id)).truncate()).on_hover_text("Show in the Runs panel").clicked(){clicked=Some(id.clone());}
      }
    });
-   if let Some(id)=clicked {self.select_run(&id);self.show_panel(ui.ctx(),7);}
+   if let Some(id)=clicked {self.select_run(&id);self.show_panel(ui.ctx(),6);}
  }
  fn select_run(&mut self,id:&str){
    self.selected_run=Some(id.to_string());
@@ -480,7 +623,7 @@ impl LaserApp {
    egui::ScrollArea::vertical().id_salt("runs_list").max_height(200.0).auto_shrink([false,true]).show(ui,|ui|{
      for r in &self.runs {
        let c=match r.outcome.as_str(){"Completed"=>Color32::from_rgb(110,210,130),"Running"=>Color32::from_rgb(235,190,70),_=>Color32::from_rgb(235,110,100)};
-       let text=egui::RichText::new(format!("{} {:<5} {:<9} {}",r.started.get(5..16).unwrap_or(&r.started),r.kind,r.outcome,r.project_name)).monospace().size(11.0).color(c);
+       let text=egui::RichText::new(format!("{} {:<5} {:<3} {:<9} {}",r.started.get(5..16).unwrap_or(&r.started),r.kind,if r.simulated{"SIM"}else{""},r.outcome,r.project_name)).monospace().size(11.0).color(c);
        if ui.add(egui::Button::new(text).selected(self.selected_run.as_ref()==Some(&r.id)).frame(self.selected_run.as_ref()==Some(&r.id)).truncate()).on_hover_text(&r.id).clicked(){clicked=Some(r.id.clone());}
      }
    });
@@ -490,7 +633,7 @@ impl LaserApp {
    ui.separator();
    egui::Grid::new("run_details").num_columns(2).spacing(Vec2::new(10.0,4.0)).show(ui,|ui|{
      ui.weak("Project");ui.label(&r.project_name);ui.end_row();
-     ui.weak("Type");ui.label(&r.kind);ui.end_row();
+     ui.weak("Type");ui.label(if r.simulated{format!("{} (SIM, virtual controller)",r.kind)}else{r.kind.clone()});ui.end_row();
      ui.weak("Started");ui.label(&r.started);ui.end_row();
      ui.weak("Ended");ui.label(&r.ended);ui.end_row();
      ui.weak("Duration");ui.label(if r.estimate_s>0.0{format!("{} (est. {})",Self::duration_hms(r.duration_s),Self::duration_hms(r.estimate_s))}else{Self::duration_hms(r.duration_s)});ui.end_row();
@@ -529,7 +672,7 @@ impl LaserApp {
    egui::Grid::new("controller_info").num_columns(2).spacing(Vec2::new(10.0,4.0)).show(ui,|ui|{
      ui.weak("Firmware");ui.add(egui::Label::new(dash(&m.info.banner)).truncate());ui.end_row();
      ui.weak("Build");ui.add(egui::Label::new(dash(&m.info.build)).truncate());ui.end_row();
-     ui.weak("Port");ui.label(format!("{} @ {}",m.selected_port,m.baud));ui.end_row();
+     ui.weak("Port");ui.label(if m.simulate{"SIMULATOR (virtual GRBL 0.9i)".to_string()}else{format!("{} @ {}",m.selected_port,m.baud)});ui.end_row();
      let st=if m.state.is_empty(){"—".to_string()}else{m.state.clone()};
      let sc=if alarm{red}else if st.starts_with("Door")||st.starts_with("Hold"){amber}else if st.starts_with("Run"){green}else{Color32::from_gray(215)};
      ui.weak("State");ui.colored_label(sc,st);ui.end_row();
@@ -560,16 +703,21 @@ impl LaserApp {
  fn panel_content(&mut self,ui:&mut egui::Ui,id:usize) {
    match id {
      0=>{
-       ui.label("Serial port");
-       ui.add(egui::TextEdit::singleline(&mut self.machine.selected_port).desired_width(f32::INFINITY));
-       ui.horizontal(|ui|{
-         egui::ComboBox::from_id_salt("ports").selected_text("Ports").show_ui(ui,|ui|{for port in self.machine.ports.clone(){if ui.selectable_label(self.machine.selected_port==port,&port).clicked(){self.machine.selected_port=port;}}});
-         if ui.button("Refresh").clicked(){self.machine.refresh();}
-       });
-       ui.horizontal(|ui|{
-         ui.label("Baud");
-         egui::ComboBox::from_id_salt("baud").selected_text(self.machine.baud.to_string()).show_ui(ui,|ui|{for baud in [9600,57600,115200,230400]{ui.selectable_value(&mut self.machine.baud,baud,baud.to_string());}});
-       });
+       if self.machine.simulate{
+         ui.colored_label(Color32::from_rgb(190,150,240),"SIMULATOR — virtual GRBL 0.9i");
+         ui.weak("Simulate is on: Connect attaches the virtual controller, not the Nano.");
+       }else{
+         ui.label("Serial port");
+         ui.add(egui::TextEdit::singleline(&mut self.machine.selected_port).desired_width(f32::INFINITY));
+         ui.horizontal(|ui|{
+           egui::ComboBox::from_id_salt("ports").selected_text("Ports").show_ui(ui,|ui|{for port in self.machine.ports.clone(){if ui.selectable_label(self.machine.selected_port==port,&port).clicked(){self.machine.selected_port=port;}}});
+           if ui.button("Refresh").clicked(){self.machine.refresh();}
+         });
+         ui.horizontal(|ui|{
+           ui.label("Baud");
+           egui::ComboBox::from_id_salt("baud").selected_text(self.machine.baud.to_string()).show_ui(ui,|ui|{for baud in [9600,57600,115200,230400]{ui.selectable_value(&mut self.machine.baud,baud,baud.to_string());}});
+         });
+       }
        match self.machine.link{
          Link::Disconnected=>{if Self::action(ui,"Connect",Color32::from_rgb(30,121,71)).clicked(){self.machine.connect();}}
          Link::Connecting=>{if Self::action(ui,"Cancel",Color32::from_rgb(91,99,112)).on_hover_text("Stop waiting for the GRBL banner and close the port").clicked(){self.machine.disconnect();}}
@@ -582,11 +730,12 @@ impl LaserApp {
      3=>{
        let mut changed=false;
        egui::Grid::new("machine-profile-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
-         ui.label("Work X");changed|=widgets::num_f32(ui,"mp_wx",&mut self.project.work_x,10.0,1.0,3000.0,1,"mm");ui.end_row();
-         ui.label("Work Y");changed|=widgets::num_f32(ui,"mp_wy",&mut self.project.work_y,10.0,1.0,3000.0,1,"mm");ui.end_row();
-         ui.label("Travel F");changed|=widgets::num_f32(ui,"mp_tf",&mut self.project.travel_feed,100.0,1.0,30000.0,0,"mm/min");ui.end_row();
-         ui.label("Max PWM S");changed|=widgets::num_u32(ui,"mp_pwm",&mut self.max_power,100,1,100000,"");ui.end_row();
+         ui.label("Work X");changed|=widgets::num_f32(ui,"mp_wx",&mut self.profile.work_x,10.0,1.0,3000.0,1,"mm");ui.end_row();
+         ui.label("Work Y");changed|=widgets::num_f32(ui,"mp_wy",&mut self.profile.work_y,10.0,1.0,3000.0,1,"mm");ui.end_row();
+         ui.label("Travel F");changed|=widgets::num_f32(ui,"mp_tf",&mut self.profile.travel_feed,100.0,1.0,30000.0,0,"mm/min");ui.end_row();
+         ui.label("Max PWM S");changed|=widgets::num_u32(ui,"mp_pwm",&mut self.profile.max_power,100,1,100000,"");ui.end_row();
        });
+       ui.weak("Saved with the app settings; applies to every project.");
        if changed {self.regenerate();}
      },
      4=>{
@@ -594,7 +743,11 @@ impl LaserApp {
        ui.label("Step (mm)");
        let step=ui.data_mut(|d|d.get_persisted::<f32>(egui::Id::new("jog_step")).unwrap_or(1.0));
        let mut new_step=step;
-       ui.horizontal(|ui|{for v in [0.1,1.0,10.0] {if ui.selectable_label((step-v).abs()<0.001,format!("{v} mm")).clicked(){new_step=v;}}});
+       ui.horizontal_wrapped(|ui|{
+         for v in [0.1,10.0] {if ui.selectable_label((step-v).abs()<0.001,format!("{v} mm")).clicked(){new_step=v;}}
+         // Typed step distance with ▲▼ (any value 0.01–500 mm).
+         widgets::num_f32(ui,"jog_step_field",&mut new_step,1.0,0.01,500.0,2,"mm");
+       });
        ui.data_mut(|d|d.insert_persisted(egui::Id::new("jog_step"),new_step));
        ui.add_space(4.0);
        ui.vertical_centered(|ui|{
@@ -615,34 +768,17 @@ impl LaserApp {
          });
        });
        ui.add_space(4.0);
-       ui.horizontal(|ui|{if ui.button("Zero X").clicked(){self.machine.command("G10 L20 P1 X0");}if ui.button("Zero Y").clicked(){self.machine.command("G10 L20 P1 Y0");}});
-       if ui.button("Go to zero").clicked(){self.machine.command("G90 G0 X0 Y0");}
+       ui.horizontal_wrapped(|ui|{
+         let ok=self.machine.connected()&&!self.machine.running;
+         if ui.add_enabled(ok,egui::Button::new("Zero X")).on_hover_text("G92 X0: the spot under the head is job X 0").clicked(){self.machine.command("G92 X0");self.zero_x=true;}
+         if ui.add_enabled(ok,egui::Button::new("Zero Y")).on_hover_text("G92 Y0: the spot under the head is job Y 0").clicked(){self.machine.command("G92 Y0");self.zero_y=true;}
+         if ui.add_enabled(ok,egui::Button::new("Go to zero")).on_hover_text("G90 G0 X0 Y0").clicked(){self.machine.command("G90 G0 X0 Y0");self.jog_pred=Some((0.0,0.0));self.last_jog=Some(Instant::now());}
+       });
+       let zx=if self.zero_x{"set"}else{"not set"};let zy=if self.zero_y{"set"}else{"not set"};
+       ui.weak(format!("Job zero: X {zx} · Y {zy} (this session)"));
      },
      5=>{self.monitor_contents(ui,false);},
-     6=>{
-       ui.horizontal_wrapped(|ui|{
-         let paused=!self.simulated&&self.sim_time>0.0&&self.sim_position<1.0;
-         if ui.add(egui::Button::new("⏵ Start").min_size(Vec2::new(86.0,26.0))).on_hover_text("Run the simulation from the beginning").clicked(){
-           self.sim_time=0.0;self.sim_position=0.0;self.simulated=!self.plan.moves.is_empty();
-         }
-         if self.simulated {
-           if ui.add(egui::Button::new(egui::RichText::new("⏸ Pause").color(Color32::WHITE)).fill(Color32::from_rgb(143,103,34)).min_size(Vec2::new(86.0,26.0))).on_hover_text("Hold at the current position").clicked(){self.simulated=false;}
-         } else if paused {
-           if ui.add(egui::Button::new(egui::RichText::new("⏵ Resume").color(Color32::WHITE)).fill(Color32::from_rgb(37,83,133)).min_size(Vec2::new(86.0,26.0))).on_hover_text("Continue from the paused position").clicked(){self.simulated=true;}
-         } else {ui.add_enabled(false,egui::Button::new("⏸ Pause").min_size(Vec2::new(86.0,26.0)));}
-         if ui.add(egui::Button::new("⏹ Reset").min_size(Vec2::new(86.0,26.0))).on_hover_text("Return to the beginning").clicked(){self.simulated=false;self.sim_time=0.0;self.sim_position=0.0;}
-       });
-       ui.horizontal_wrapped(|ui|{
-         ui.label("Speed");
-         for sp in SIM_SPEEDS {ui.selectable_value(&mut self.sim_speed,sp,format!("{}×",sp as u32));}
-       });
-       ui.horizontal_wrapped(|ui|{
-         ui.label(format!("{} / {}",Self::duration_hms(self.sim_time),Self::duration_hms(self.plan.estimated_seconds)));
-         ui.weak("(constant-speed estimate)");
-       });
-       if self.sim_time>0.0 {ui.add(egui::ProgressBar::new(self.sim_position).show_percentage().desired_height(16.0));}
-     },
-     7=>{self.runs_panel(ui);},
+     6=>{self.runs_panel(ui);},
      _=>{}
    }
  }
@@ -659,7 +795,7 @@ impl LaserApp {
        for id in LEFT_DOCK {if !self.panels[id].floating {self.panel_ui(ui,id);ui.separator();}}
      });
    });
-   // Right dock: Jog Controls, G-code / Stream, Simulation stacked in one column.
+   // Right dock: Shape Properties, Jog Controls, G-code / Stream stacked in one column.
    if RIGHT_DOCK.iter().any(|&id|!self.panels[id].floating) {
      egui::SidePanel::right("right_dock").resizable(true).default_width(320.0).min_width(240.0).show(ctx,|ui|{
        egui::ScrollArea::vertical().show(ui,|ui|{
@@ -668,17 +804,18 @@ impl LaserApp {
      });
    }
    // Floating windows: native title bar (drag to move, arrow to collapse), resizable edges.
-   // Shape Properties (PROPS) has no side dock: "docked" means hidden in the canvas tool strip.
    for id in 0..TITLES.len() {
      if self.panels[id].floating {
-       egui::Window::new(TITLES[id]).id(egui::Id::new(("floating_panel",TITLES[id])))
-         .resizable(true).collapsible(true).min_width(240.0).min_height(160.0)
+       let mut win=egui::Window::new(TITLES[id]).id(egui::Id::new(("floating_panel",TITLES[id])));
+       // G-code / Stream floats over the canvas: background 80 % transparent, no shadow.
+       if id==5{win=win.frame(egui::Frame::window(&ctx.style()).fill(Color32::from_rgba_unmultiplied(22,23,26,51)).shadow(egui::Shadow::NONE));}
+       win.resizable(true).collapsible(true).min_width(240.0).min_height(160.0)
          .default_size(match id{5=>Vec2::new(380.0,620.0),PROPS=>Vec2::new(300.0,520.0),_=>Vec2::new(320.0,360.0)})
          .default_pos(if id==PROPS{egui::Pos2::new(330.0,190.0)}else{egui::Pos2::new(340.0+id as f32*24.0,150.0+id as f32*24.0)})
          .show(ctx,|ui|{
            ui.horizontal(|ui|{
              ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-               let tip=if id==PROPS{"Hide back into the canvas tool strip"}else{"Return to the default docked position"};
+               let tip="Return to the default docked position";
                if ui.small_button("Dock").on_hover_text(tip).clicked(){self.panels[id].floating=false;}
              });
            });
@@ -713,22 +850,31 @@ impl LaserApp {
      });
    });
    ui.separator();
-   // ---- Row 2: fixed machine controls ----
-   ui.horizontal(|ui|{
+   // ---- Row 2: fixed machine controls (wraps on narrow windows) ----
+   ui.horizontal_wrapped(|ui|{
      ui.spacing_mut().item_spacing.x=6.0;
      let max=self.max_power;
-     if Self::action(ui,"Spot ON",Color32::from_rgb(38,84,148)).on_hover_text("Low-power spot for positioning: M3 S<power>").clicked(){
-       self.machine.command(&format!("M3 S{}",self.spot_power));
-     }
+     let (spot_label,spot_fill,spot_tip)=if self.spot_on{("Spot OFF",Color32::from_rgb(196,132,28),"Spot is ON: click to send M5")}
+       else{("Spot ON",Color32::from_rgb(38,84,148),"Low-power spot for positioning: M3 S<power>. Click again to switch off.")};
+     if Self::action(ui,spot_label,spot_fill).on_hover_text(spot_tip).clicked(){self.toggle_spot();}
      widgets::num_u32(ui,"spot_power",&mut self.spot_power,1,0,max,&format!("/ {max}"));
      ui.separator();
-     if Self::action(ui,"Frame",Color32::from_rgb(85,92,110)).on_hover_text("Trace the geometry boundary at spot power").clicked(){
-       let lines=self.frame_commands();if lines.is_empty(){self.notice="No valid frame boundary".into();}else{self.begin_run("Frame",lines);}
+     if Self::action(ui,"Trace",Color32::from_rgb(85,92,110)).on_hover_text("Trace the selected outline at spot power and trace feed, relative to the job origin").clicked(){
+       match self.trace_program(){Ok((lines,path))=>self.begin_run("Trace",lines,path),Err(e)=>self.notice=e}
      }
+     let fence_on=self.project.fence.on;
+     if !fence_on&&self.trace_target==TraceTarget::Fence{self.trace_target=TraceTarget::Job;}
+     egui::ComboBox::from_id_salt("trace_target").width(70.0)
+       .selected_text(match self.trace_target{TraceTarget::Part=>"Part",TraceTarget::Job=>"Job",TraceTarget::Fence=>"Fence"})
+       .show_ui(ui,|ui|{
+         ui.selectable_value(&mut self.trace_target,TraceTarget::Part,"Part").on_hover_text("Box around the selected shape(s)");
+         ui.selectable_value(&mut self.trace_target,TraceTarget::Job,"Job").on_hover_text("Box around all shapes");
+         ui.add_enabled_ui(fence_on,|ui|{ui.selectable_value(&mut self.trace_target,TraceTarget::Fence,"Fence").on_hover_text("The work fence rectangle").on_disabled_hover_text("Turn the work fence on in the canvas tool strip");});
+       });
      widgets::num_f32(ui,"frame_feed",&mut self.frame_feed,100.0,1.0,10000.0,0,"mm/min");
      ui.separator();
      if Self::action(ui,"⏵ Start",Color32::from_rgb(27,125,68)).clicked(){
-       if !self.plan.moves.is_empty()&&self.plan.warnings.is_empty(){let lines=self.plan.lines.clone();self.begin_run("Job",lines);}
+       if !self.plan.moves.is_empty()&&self.plan.warnings.is_empty(){let lines=self.plan.lines.clone();let path=self.plan.moves.clone();self.begin_run("Job",lines,path);}
        else{self.notice="Start requires a valid toolpath and no warnings".into();}
      }
      // Pause/Resume driven by the GRBL state word from status reports.
@@ -758,43 +904,58 @@ impl LaserApp {
        self.machine.abort();
      }
      ui.separator();
-     if Self::action(ui,"Laser ON",Color32::from_rgb(176,84,24)).on_hover_text("M3 S<power>: beam stays on until Laser OFF, including while jogging").clicked(){
-       self.machine.command(&format!("M3 S{}",self.laser_power));
+     if Self::action(ui,"Laser OFF",Color32::from_rgb(144,53,55)).on_hover_text("M5 (also switches Spot off)").clicked(){self.laser_off();}
+     ui.separator();
+     // Simulate: virtual controller instead of the Nano. Switchable only while disconnected.
+     let sim=self.machine.simulate;let can_switch=self.machine.link==Link::Disconnected;
+     let fill=if sim{Color32::from_rgb(112,72,170)}else{Color32::from_rgb(70,74,82)};
+     let tip=if can_switch{if sim{"Simulate is ON: Connect uses the virtual controller. Click to switch off."}else{"Switch to the virtual controller (no machine)"}}else{"Disconnect first to switch Simulate"};
+     if ui.add_enabled(can_switch,egui::Button::new(egui::RichText::new("Simulate").color(Color32::WHITE).strong()).fill(fill).min_size(Vec2::new(88.0,30.0)))
+       .on_hover_text(tip).on_disabled_hover_text(tip).clicked(){self.machine.simulate=!sim;}
+     let mut speed=self.machine.sim_speed;
+     egui::ComboBox::from_id_salt("sim_speed").width(56.0).selected_text(format!("{}×",speed as u32)).show_ui(ui,|ui|{
+       for sp in SIM_SPEEDS{ui.selectable_value(&mut speed,sp,format!("{}×",sp as u32));}
+     }).response.on_hover_text("Simulate speed (applies during a run)");
+     if speed!=self.machine.sim_speed{self.machine.set_sim_speed(speed);}
+     if sim{
+       let (slot,_)=ui.allocate_exact_size(Vec2::new(96.0,22.0),egui::Sense::hover());
+       ui.painter().rect_filled(slot,CornerRadius::same(4),Color32::from_rgb(112,72,170));
+       ui.painter().text(slot.center(),egui::Align2::CENTER_CENTER,"SIMULATION",egui::FontId::proportional(12.0),Color32::WHITE);
      }
-     widgets::num_u32(ui,"laser_power",&mut self.laser_power,10,0,max,&format!("/ {max}"));
-     if Self::action(ui,"Laser OFF",Color32::from_rgb(144,53,55)).on_hover_text("M5").clicked(){self.machine.command("M5");}
    });
    ui.add_space(2.0);
  }
  fn canvas(&mut self,ui:&mut egui::Ui){
-   self.view.props_floating=self.panels[PROPS].floating;
    if self.view.toolbar(ui,&mut self.project,&mut self.selected){self.regenerate();}
-   if std::mem::take(&mut self.view.props_toggle){self.panels[PROPS].floating=!self.panels[PROPS].floating;}
    ui.add_space(2.0);
-   let (index,_,head)=self.simulated_cursor();
-   let sim=SimOverlay{active:self.simulated||self.sim_time>0.0,index,head};
+   let sim=match &self.live{
+     // Live run: own path, progress from the reported position.
+     Some(lv)=>{
+       // Laser colour: the virtual controller's state in Simulate, else the current path segment (burn / travel).
+       let laser=self.machine.sim_laser().unwrap_or_else(||lv.path.get(lv.progress).is_some_and(|m|m.laser));
+       SimOverlay{active:lv.head.is_some(),index:lv.progress,head:lv.head.unwrap_or(lv.origin),start:lv.origin,path:Some(lv.path.as_slice()),laser}
+     }
+     None=>SimOverlay{active:false,index:0,head:self.plan.origin,start:self.plan.origin,path:None,laser:false},
+   };
    if self.view.show(ui,&mut self.project,&mut self.selected,&self.plan,&sim){self.regenerate();}
-   // Auto pop-out: a newly selected shape while Shape Properties is docked.
-   if !self.selected.is_empty()&&self.selected!=self.props_last_sel&&!self.panels[PROPS].floating {self.panels[PROPS].floating=true;}
+   // A newly selected shape expands the docked Shape Properties panel.
+   if !self.selected.is_empty()&&self.selected!=self.props_last_sel&&!self.panels[PROPS].floating {self.show_panel(ui.ctx(),PROPS);}
    self.props_last_sel=self.selected.clone();
  }
  fn monitor_contents(&mut self,ui:&mut egui::Ui,floating:bool){
-   let sim=self.simulated||self.sim_time>0.0;
-   // Source: simulation shows the generated program; live view shows what is/was streamed (program or frame).
-   let live_job=!sim&&!self.job_lines.is_empty();
+   // Source: what is/was streamed (program or trace); otherwise the generated program.
+   let live_job=!self.job_lines.is_empty();
    let total=if live_job{self.job_lines.len()}else{self.plan.lines.len()};
-   let (sent,acked)=(self.machine.next_line.min(total),self.machine.acknowledged.min(total));
-   let current=if sim{self.sim_line().min(total)}else{sent.saturating_sub(1)};
+   // Counts never go negative: after Reset / Disconnect `next_line` returns to 0 while `acknowledged` keeps the run's count.
+   let sent=self.machine.next_line.min(total);let acked=self.machine.acknowledged.min(sent);
+   let current=sent.saturating_sub(1);
    let mono=egui::FontId::monospace(11.0);
    let small=egui::FontId::proportional(11.5);
    // ---- header: counts + copy ----
    ui.horizontal(|ui|{
-     if sim {ui.label(egui::RichText::new(format!("SIM  line {} / {}",current.min(total),total)).font(small.clone()));}
-     else {
-       ui.label(egui::RichText::new(format!("Queued {}",total-sent)).font(small.clone()).color(Color32::from_gray(160)));
-       ui.label(egui::RichText::new(format!("Sent {}",sent-acked)).font(small.clone()).color(Color32::from_rgb(235,200,80)));
-       ui.label(egui::RichText::new(format!("OK {}",acked)).font(small.clone()).color(Color32::from_rgb(110,210,130)));
-     }
+     ui.label(egui::RichText::new(format!("Queued {}",total-sent)).font(small.clone()).color(Color32::from_gray(160)));
+     ui.label(egui::RichText::new(format!("Sent {}",sent-acked)).font(small.clone()).color(Color32::from_rgb(235,200,80)));
+     ui.label(egui::RichText::new(format!("OK {}",acked)).font(small.clone()).color(Color32::from_rgb(110,210,130)));
      ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
        if ui.small_button("Copy G-code").on_hover_text("Copy the generated program").clicked(){ui.ctx().copy_text(self.plan.lines.join("\n"));}
      });
@@ -806,7 +967,8 @@ impl LaserApp {
        s if s.starts_with("Alarm")=>Color32::from_rgb(235,90,90),_=>Color32::from_gray(170)};
      ui.label(egui::RichText::new("Controller").font(small.clone()).color(Color32::from_gray(140)));
      ui.label(egui::RichText::new(st).font(small.clone()).color(c).strong());
-     ui.label(egui::RichText::new(if live_job{"· streaming job"}else if sim{"· simulation"}else{"· program"}).font(small.clone()).color(Color32::from_gray(120)));
+     let src=if live_job{if self.machine.simulate{"· streamed (SIM)"}else{"· streamed"}}else{"· program"};
+     ui.label(egui::RichText::new(src).font(small.clone()).color(Color32::from_gray(120)));
    });
    ui.separator();
    // ---- sizes: floating fills its window; docked uses a share of the screen ----
@@ -819,7 +981,7 @@ impl LaserApp {
    let spacing=ui.spacing().item_spacing.y;
    let mut area=egui::ScrollArea::both().id_salt("gcode_lines").max_height(stream_h).auto_shrink([false,false]);
    if !floating {area=area.min_scrolled_height(stream_h);}
-   let active=sim||self.machine.running;
+   let active=self.machine.running;
    if active&&current!=self.monitor_follow {
      area=area.vertical_scroll_offset(((current as f32)*(row_h+spacing)-stream_h*0.4).max(0.0));
      self.monitor_follow=current;
@@ -828,9 +990,7 @@ impl LaserApp {
    let lines=if live_job{&self.job_lines}else{&self.plan.lines};
    area.show_rows(ui,row_h,total,|ui,range|{
      for i in range {
-       let (mark,color)=if sim{
-         if i<current{("✔",Color32::from_rgb(110,210,130))}else if i==current{("▶",Color32::from_rgb(250,220,90))}else{("·",Color32::from_gray(150))}
-       }else if err_line==Some(i){("✖",Color32::from_rgb(240,95,95))}
+       let (mark,color)=if err_line==Some(i){("✖",Color32::from_rgb(240,95,95))}
        else if live_job&&i<acked{("✔",Color32::from_rgb(110,210,130))}
        else if live_job&&i<sent{("▶",Color32::from_rgb(250,220,90))}
        else{("·",Color32::from_gray(150))};
@@ -858,7 +1018,7 @@ impl LaserApp {
      let enter=edit.lost_focus()&&ui.input(|i|i.key_pressed(egui::Key::Enter));
      let has=!self.manual_cmd.trim().is_empty();
      if ui.add_enabled(can&&has,egui::Button::new("Send")).clicked()||(enter&&can&&has){
-       let c=self.manual_cmd.trim().to_string();self.machine.command(&c);self.manual_cmd.clear();edit.request_focus();
+       let c=self.manual_cmd.trim().to_string();self.machine.command(&c);self.note_manual(&c);self.manual_cmd.clear();edit.request_focus();
      }
    });
  }
@@ -927,20 +1087,42 @@ impl LaserApp {
        });
        next.unwrap_or(Dialog::Unsaved{then})
      }
+     Dialog::Notice{title,msg}=>{
+       let mut next=None;
+       modal(&title).show(ctx,|ui|{
+         ui.set_max_width(380.0);
+         ui.label(&msg);
+         ui.add_space(6.0);
+         if ui.button("OK").clicked()||ui.input(|i|i.key_pressed(egui::Key::Enter)||i.key_pressed(egui::Key::Escape)){next=Some(Dialog::None);}
+       });
+       next.unwrap_or(Dialog::Notice{title,msg})
+     }
    };
  }
+}
+
+/// Distance from point p to segment a-b.
+fn seg_dist(p:(f32,f32),a:(f32,f32),b:(f32,f32))->f32{
+  let (dx,dy)=(b.0-a.0,b.1-a.1);let l2=dx*dx+dy*dy;
+  let t=if l2>0.0{(((p.0-a.0)*dx+(p.1-a.1)*dy)/l2).clamp(0.0,1.0)}else{0.0};
+  ((p.0-a.0-t*dx).powi(2)+(p.1-a.1-t*dy).powi(2)).sqrt()
 }
 
 impl eframe::App for LaserApp {
  fn update(&mut self,ctx:&egui::Context,_frame:&mut eframe::Frame){
    let dt=self.last_frame.elapsed().as_secs_f32().min(0.2);self.last_frame=Instant::now();
    self.machine.poll();
+   // A controller reset (banner) or disconnect invalidates the work zero and the spot state.
+   if self.machine.reset_count!=self.seen_resets||!self.machine.connected(){
+     self.seen_resets=self.machine.reset_count;self.zero_x=false;self.zero_y=false;self.spot_on=false;self.jog_pred=None;
+   }
+   if self.machine.state.starts_with("Alarm"){self.spot_on=false;}
    self.drain_journal();
    self.track_run();
-   if self.simulated {let estimate=self.plan.estimated_seconds.max(0.01);self.sim_time=(self.sim_time+dt*self.sim_speed).min(estimate);self.sim_position=(self.sim_time/estimate).min(1.0);if self.sim_position>=1.0{self.simulated=false;}}
+   self.update_live(dt);
    // Drawing on an empty canvas starts an (unsaved) project.
    if !self.project_active&&!self.project.shapes.is_empty(){self.project_active=true;self.saved_once=false;}
-   self.dirty=self.project_active&&serde_json::to_string(&self.project).map(|j|j!=self.saved_json).unwrap_or(false);
+   self.dirty=self.project_active&&Self::comparable_json(&self.project)!=self.saved_json;
    let title=format!("Laser CNC Controller v{}{}",env!("CARGO_PKG_VERSION"),
      if self.project_active{format!(" — {}{}",self.project.name,if self.dirty{" *"}else{""})}else{String::new()});
    if title!=self.last_title {ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));self.last_title=title;}
@@ -959,10 +1141,11 @@ impl eframe::App for LaserApp {
    // Floating/docked flags. Collapse state, window positions/sizes and dock widths
    // are persisted automatically through egui memory.
    eframe::set_value(storage,LAYOUT_KEY,&self.panels);
+   eframe::set_value(storage,PROFILE_KEY,&self.profile);
  }
 }
 // =============================================================================
 // End of file: app.rs
 // Location:    laser-cnc-controller/src/app.rs
-// Created:     2026-10-13 15:15:40 UTC
+// Created:     2026-10-13 18:25:33 UTC
 // =============================================================================

@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     machine.rs
 // Location: laser-cnc-controller/src/machine.rs
-// Version:  v0.1.3
+// Version:  v0.1.5
 // Comments: GRBL 0.9i serial transport.
 //           v0.1.1:
 //           - Machine state word parsed from status reports (<Run,...>,
@@ -32,11 +32,39 @@
 //           - Manual commands and jogs go through the same counted queue.
 //           - unlock() sends $X.
 //           - Write timeout 1000 ms; reads only when bytes are available.
+//           v0.1.4: reset_count increments on every GRBL banner (connect,
+//           Reset, alarm reset) so the app can drop session state that a
+//           controller reset invalidates (work zero, spot toggle).
+//           v0.1.5: Simulate mode.
+//           - The worker talks to a Port: the serial port (HwPort) or the
+//             virtual GRBL (src/vgrbl.rs). Everything above the Port is the
+//             same code path.
+//           - simulate (set while disconnected): Connect attaches the virtual
+//             controller ("SIMULATOR"). sim_speed scales its time (1–50x),
+//             changeable during a run. sim_laser() reports its laser state.
 // =============================================================================
 use std::collections::VecDeque;
 use std::io::{Read,Write};
 use std::sync::mpsc::{self,Receiver,Sender,TryRecvError};
 use std::time::{Duration,Instant};
+use crate::vgrbl::{SimShared,VirtualGrbl};
+
+/// Byte transport under the serial worker: hardware serial port or the virtual controller.
+pub trait Port:Send{
+    fn write_all(&mut self,bytes:&[u8])->std::io::Result<()>;
+    fn available(&mut self)->std::io::Result<usize>;
+    fn read(&mut self,buf:&mut [u8])->std::io::Result<usize>;
+    fn dtr_low(&mut self){}
+    fn clear_input(&mut self){}
+}
+struct HwPort(Box<dyn serialport::SerialPort>);
+impl Port for HwPort{
+    fn write_all(&mut self,bytes:&[u8])->std::io::Result<()>{self.0.write_all(bytes)}
+    fn available(&mut self)->std::io::Result<usize>{self.0.bytes_to_read().map(|n|n as usize).map_err(std::io::Error::from)}
+    fn read(&mut self,buf:&mut [u8])->std::io::Result<usize>{self.0.read(buf)}
+    fn dtr_low(&mut self){let _=self.0.write_data_terminal_ready(false);}
+    fn clear_input(&mut self){let _=self.0.clear(serialport::ClearBuffer::Input);}
+}
 
 /// GRBL serial RX buffer model (LaserGRBL DEFAULT_BUFFER_SIZE).
 pub const RX_BUFFER:usize=127;
@@ -94,15 +122,29 @@ pub struct Machine {
     pub error:Option<String>, pub error_line:Option<usize>,
     pub job_errors:usize, pub job_error:Option<String>, pub alarm:Option<String>,
     pub journal:Vec<String>, pub firmware:Option<String>, pub info:ControllerInfo,
+    pub reset_count:u32,
+    pub simulate:bool, pub sim_speed:f32, sim:Option<SimShared>,
 }
-impl Default for Machine {fn default()->Self{Self{worker:None,link:Link::Disconnected,ports:vec![],selected_port:String::new(),baud:115200,log:vec![],status:"Disconnected".into(),state:String::new(),position:(0.0,0.0),next_line:0,running:false,acknowledged:0,error:None,error_line:None,job_errors:0,job_error:None,alarm:None,journal:vec![],firmware:None,info:ControllerInfo::default()}}}
+impl Default for Machine {fn default()->Self{Self{worker:None,link:Link::Disconnected,ports:vec![],selected_port:String::new(),baud:115200,log:vec![],status:"Disconnected".into(),state:String::new(),position:(0.0,0.0),next_line:0,running:false,acknowledged:0,error:None,error_line:None,job_errors:0,job_error:None,alarm:None,journal:vec![],firmware:None,info:ControllerInfo::default(),reset_count:0,simulate:false,sim_speed:1.0,sim:None}}}
 impl Machine {
     pub fn refresh(&mut self){if let Ok(ports)=serialport::available_ports(){self.ports=ports.into_iter().map(|p|p.port_name).collect();if self.selected_port.is_empty(){if let Some(s)=self.ports.first(){self.selected_port=s.clone();}}}}
     pub fn connected(&self)->bool{self.link==Link::Connected}
-    /// Open the port and start the serial worker. Connected once the GRBL banner arrives.
+    /// Virtual controller laser state (Simulate mode only).
+    pub fn sim_laser(&self)->Option<bool>{self.sim.as_ref().map(|s|s.laser.load(std::sync::atomic::Ordering::Relaxed))}
+    pub fn set_sim_speed(&mut self,speed:f32){self.sim_speed=speed;if let Some(s)=&self.sim{s.set_speed(speed);}}
+    /// Label of the port in use (hardware port name or SIMULATOR).
+    pub fn port_label(&self)->String{if self.simulate{"SIMULATOR".into()}else{self.selected_port.clone()}}
+    /// Open the port (or the virtual controller) and start the serial worker. Connected once the GRBL banner arrives.
     pub fn connect(&mut self){
         if self.worker.is_some(){return;}
-        match serialport::new(&self.selected_port,self.baud).timeout(WRITE_TIMEOUT).open(){
+        let opened:Result<Box<dyn Port>,String>=if self.simulate{
+            let shared=SimShared::new(self.sim_speed);self.sim=Some(shared.clone());
+            Ok(Box::new(VirtualGrbl::new(shared)))
+        }else{
+            self.sim=None;
+            serialport::new(&self.selected_port,self.baud).timeout(WRITE_TIMEOUT).open().map(|p|Box::new(HwPort(p)) as Box<dyn Port>).map_err(|e|e.to_string())
+        };
+        match opened{
             Ok(port)=>{
                 let (cmd_tx,cmd_rx)=mpsc::channel();
                 let (ev_tx,ev_rx)=mpsc::channel();
@@ -116,10 +158,10 @@ impl Machine {
                 self.status="Connecting… waiting for GRBL banner".into();
                 self.state.clear();self.error=None;self.firmware=None;self.info=ControllerInfo::default();
                 self.running=false;self.next_line=0;self.acknowledged=0;self.error_line=None;
-                self.log.push(format!("Connecting {} @ {}",self.selected_port,self.baud));
-                self.journal.push(format!("CONNECT {} @ {}",self.selected_port,self.baud));
+                self.log.push(format!("Connecting {} @ {}",self.port_label(),self.baud));
+                self.journal.push(format!("CONNECT {} @ {}",self.port_label(),self.baud));
             }
-            Err(e)=>{self.error=Some(e.to_string());self.status=format!("Connect failed: {e}");}
+            Err(e)=>{self.error=Some(e.clone());self.status=format!("Connect failed: {e}");}
         }
     }
     pub fn disconnect(&mut self){
@@ -129,7 +171,7 @@ impl Machine {
         self.status="Disconnected".into();
         self.journal.push("DISCONNECT".into());
     }
-    fn drop_link(&mut self){self.worker=None;self.link=Link::Disconnected;self.running=false;self.state.clear();}
+    fn drop_link(&mut self){self.worker=None;self.sim=None;self.link=Link::Disconnected;self.running=false;self.state.clear();}
     fn send(&mut self,c:Cmd){if let Some((tx,_))=&self.worker{let _=tx.send(c);}}
     pub fn realtime(&mut self,b:u8){if self.worker.is_some(){self.send(Cmd::Realtime(b));}}
     /// Queue a manual line (G-code or $ command). Refused while a job streams.
@@ -175,7 +217,7 @@ impl Machine {
     fn handle(&mut self,e:Event){
         match e{
             Event::Connected(banner)=>{
-                self.link=Link::Connected;self.status="Connected".into();
+                self.link=Link::Connected;self.status="Connected".into();self.reset_count+=1;
                 self.firmware=Some(banner.clone());self.info.banner=Some(banner.clone());
                 self.log.push(format!("RX {banner}"));self.journal.push(format!("RX {banner}"));
             }
@@ -190,7 +232,7 @@ impl Machine {
             Event::Status(s)=>self.parse_status(&s),
             Event::Rx(s)=>{
                 self.log.push(format!("RX {s}"));self.journal.push(format!("RX {s}"));
-                if s.starts_with("Grbl "){self.firmware=Some(s.clone());self.info.banner=Some(s.clone());self.running=false;}
+                if s.starts_with("Grbl "){self.firmware=Some(s.clone());self.info.banner=Some(s.clone());self.running=false;self.reset_count+=1;}
                 else if s.starts_with("ALARM"){
                     if self.running&&self.alarm.is_none(){self.alarm=Some(s.clone());}
                     self.error=Some(s.clone());self.running=false;
@@ -261,7 +303,7 @@ impl Item{
     }
 }
 struct Worker{
-    port:Box<dyn serialport::SerialPort>, rx:Receiver<Cmd>, tx:Sender<Event>,
+    port:Box<dyn Port>, rx:Receiver<Cmd>, tx:Sender<Event>,
     queue:VecDeque<Item>, pending:VecDeque<Item>, used:usize, job_active:bool,
     incoming:Vec<u8>, connected:bool, opened:Instant, retried:bool, last_status:Option<Instant>,
 }
@@ -269,8 +311,8 @@ impl Worker{
     fn emit(&self,e:Event){let _=self.tx.send(e);}
     fn run(mut self){
         // Handshake: DTR low (no hardware reset from us), discard stale input, soft reset.
-        let _=self.port.write_data_terminal_ready(false);
-        let _=self.port.clear(serialport::ClearBuffer::Input);
+        self.port.dtr_low();
+        self.port.clear_input();
         if !self.write(&[0x18]){return;}
         let mut buf=[0u8;1024];
         loop{
@@ -292,7 +334,7 @@ impl Worker{
                 self.last_status=Some(Instant::now());
             }
             // ---- receive ----
-            let available=match self.port.bytes_to_read(){Ok(n)=>n as usize,Err(e)=>{self.emit(Event::PortError(e.to_string()));return;}};
+            let available=match self.port.available(){Ok(n)=>n,Err(e)=>{self.emit(Event::PortError(e.to_string()));return;}};
             let mut busy=false;
             if available>0{
                 let n=available.min(buf.len());
@@ -385,5 +427,5 @@ impl Worker{
 // =============================================================================
 // End of file: machine.rs
 // Location:    laser-cnc-controller/src/machine.rs
-// Created:     2026-10-13 15:15:40 UTC
+// Created:     2026-10-13 17:54:31 UTC
 // =============================================================================

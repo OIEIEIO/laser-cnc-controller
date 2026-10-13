@@ -1,11 +1,21 @@
 // =============================================================================
 // File:     geometry.rs
 // Location: laser-cnc-controller/src/geometry.rs
-// Version:  v0.1.1
+// Version:  v0.1.3
 // Comments: Serializable millimetre geometry and laser process parameters.
 //           v0.1.1: Project gains a permanent `id` used to link run records.
 //           Older saved projects without an id load with an empty id and are
 //           assigned one on first open (see app.rs).
+//           v0.1.2:
+//           - Project `origin`: job origin marker in canvas millimetres. The
+//             generated program is relative to it (marker = job 0,0 = the
+//             spot zeroed on the machine with G92). Default (0,0), so older
+//             projects generate the same coordinates as before.
+//           - Project `fence`: work fence anchored at the origin marker,
+//             0..w by 0..h relative to it, with an on/off switch.
+//             Older projects load with the fence off.
+//           v0.1.3: default work area 380 x 280 mm (the app overrides it with
+//           the saved Machine Profile).
 // =============================================================================
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +48,14 @@ impl Shape {
         (x0,y0,x1,y1)
     }
 }
+
+/// Work fence: 0..w by 0..h relative to the job origin marker.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fence { pub on: bool, pub w: f32, pub h: f32 }
+impl Default for Fence {
+    fn default() -> Self { Self { on: false, w: 100.0, h: 100.0 } }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default)]
@@ -47,9 +65,13 @@ pub struct Project {
     pub work_x: f32,
     pub work_y: f32,
     pub travel_feed: f32,
+    #[serde(default)]
+    pub origin: (f32, f32),
+    #[serde(default)]
+    pub fence: Fence,
 }
 impl Default for Project {
-    fn default() -> Self { Self {id:String::new(),name:"LIG Strip Test".into(), shapes:vec![Shape::rectangle(15.0,20.0,75.0,10.0)],work_x:300.0,work_y:200.0,travel_feed:2500.0} }
+    fn default() -> Self { Self {id:String::new(),name:"LIG Strip Test".into(), shapes:vec![Shape::rectangle(15.0,20.0,75.0,10.0)],work_x:380.0,work_y:280.0,travel_feed:2500.0,origin:(0.0,0.0),fence:Fence::default()} }
 }
 impl Project {
     /// Empty project with a fresh permanent id.
@@ -66,5 +88,5 @@ pub fn new_id() -> String {
 // =============================================================================
 // End of file: geometry.rs
 // Location:    laser-cnc-controller/src/geometry.rs
-// Created:     2026-10-12 22:40:08 UTC
+// Created:     2026-10-13 18:25:33 UTC
 // =============================================================================
