@@ -1,0 +1,28 @@
+# =============================================================================
+# File:     Cargo.toml
+# Location: laser-cnc-controller/Cargo.toml
+# Version:  v0.1.5
+# Comments: Package manifest. v0.1.4: project management, run records, daily log.
+#           v0.1.5: threaded LaserGRBL-style buffered streaming, connection
+#           info, Unlock, manual command line. No dependency changes.
+#           chrono added for local timestamps in run records, logs and exports.
+#           eframe "persistence" feature enabled for saved panel layout.
+# =============================================================================
+[package]
+name = "laser-cnc-controller"
+version = "0.1.5"
+edition = "2021"
+description = "Local laser CNC geometry editor and GRBL 0.9i controller"
+
+[dependencies]
+eframe = { version = "0.31", features = ["persistence"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+redb = "2.4"
+serialport = { version = "4.7", default-features = false }
+chrono = "0.4"
+# =============================================================================
+# End of file: Cargo.toml
+# Location:    laser-cnc-controller/Cargo.toml
+# Created:     2026-10-13 15:15:40 UTC
+# =============================================================================

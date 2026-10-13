@@ -1,0 +1,13 @@
+# =============================================================================
+# File:     .gitignore
+# Location: laser-cnc-controller/.gitignore
+# Version:  v0.1.0
+# Comments: Build output and local redb databases.
+# =============================================================================
+/target/
+*.redb
+# =============================================================================
+# End of file: .gitignore
+# Location:    laser-cnc-controller/.gitignore
+# Created:     2026-10-12 18:37:43 UTC
+# =============================================================================
