@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     app.rs
 // Location: laser-cnc-controller/src/app.rs
-// Version:  v0.2.2
+// Version:  v0.2.3
 // Comments: Application shell: theme, panels, machine-control row, project
 //           management, run recording, simulation timing, G-code monitor.
 //           - Fixed machine-control row under the File/Help line, in job order:
@@ -157,6 +157,19 @@
 //             time; Estimated is their sum (src/gcode.rs).
 //           - Live runs (Job and Trace, machine and Simulate) pass the run
 //             clock and the trajectory duration to the canvas countdown.
+//           v0.2.3: live-view clock synced to the controller's position reports.
+//           - Each new status report (every 250 ms) is located on the planned
+//             trajectory near the run clock (motion_planner::Trajectory::
+//             locate). The machine's time is that point plus the time since
+//             the report. The clock then runs faster or slower than real time
+//             (rate 1 + error / 0.6 s, limited to 0 … 3) to close the
+//             difference smoothly; a difference over 3 s is taken at once.
+//             The head marker, done path, laser colour and countdown follow
+//             the corrected clock.
+//           - Reports farther than 2 mm from the path near the clock (e.g. the
+//             head before motion starts) are not used.
+//           - Position reports are GRBL's step counts: steps lost by the motors
+//             are not seen.
 // =============================================================================
 use eframe::egui::{self,Color32,CornerRadius,Stroke,Vec2};
 use eframe::egui::collapsing_header::CollapsingState;
@@ -206,8 +219,16 @@ enum TraceTarget{Part,Job,Fence}
 
 /// Live view of a Job or Trace run: the planned trajectory of the streamed lines (program
 /// coordinates), its moves in canvas coordinates for drawing, and the run clock.
+/// `sync`: machine time from the last usable position report and when it arrived.
 struct LiveView{traj:Trajectory,path:Vec<Move>,origin:(f32,f32),start:(f32,f32),clock:f32,last:Instant,
-  progress:usize,head:(f32,f32),laser:bool}
+  progress:usize,head:(f32,f32),laser:bool,seen_seq:u32,sync:Option<(f32,Instant)>}
+/// Live-view sync: catch-up time constant (s), largest difference closed smoothly (s),
+/// search window around the clock (s), time weight (mm/s), largest usable distance from the path (mm).
+const SYNC_TAU:f32=0.6;
+const SYNC_SNAP:f32=3.0;
+const SYNC_WINDOW:f32=4.0;
+const SYNC_WEIGHT:f32=0.02;
+const SYNC_MAX_DIST:f32=2.0;
 
 /// Project action that may need an unsaved-changes prompt first.
 #[derive(Clone)]
@@ -482,7 +503,8 @@ impl LaserApp {
     let path:Vec<Move>=traj.segments.iter().map(|s|Move{x:origin.0+s.block.end[0],y:origin.1+s.block.end[1],
       feed:s.block.feed,power:s.block.power,laser:s.block.laser,rapid:s.block.rapid}).collect();
     let start=(origin.0+traj.start[0],origin.1+traj.start[1]);
-    self.live=Some(LiveView{traj,path,origin,start,clock:0.0,last:Instant::now(),progress:0,head:start,laser:false});
+    self.live=Some(LiveView{traj,path,origin,start,clock:0.0,last:Instant::now(),progress:0,head:start,laser:false,
+      seen_seq:self.machine.status_seq,sync:None});
     let record=RunRecord{kind:kind.into(),project_id:self.project.id.clone(),project_name:self.project.name.clone(),
       estimate_s:if kind=="Job"{self.plan.estimated_seconds}else{0.0},
       port:self.machine.port_label(),baud:self.machine.baud,firmware:self.machine.firmware.clone(),simulated:self.machine.simulate,
@@ -623,7 +645,25 @@ impl LaserApp {
     let elapsed=(now-lv.last).as_secs_f32();lv.last=now;
     let state=&self.machine.state;
     let held=state.starts_with("Hold")||state.starts_with("Door")||state.starts_with("Alarm");
-    if !held{lv.clock+=elapsed*if self.machine.simulate{self.machine.sim_speed}else{1.0};}
+    let speed=if self.machine.simulate{self.machine.sim_speed}else{1.0};
+    // New position report: where on the planned path is the machine, in planned time?
+    if self.machine.status_seq!=lv.seen_seq{
+      lv.seen_seq=self.machine.status_seq;
+      if let (Some(w),Some(at))=(self.machine.info.wpos,self.machine.status_at){
+        if let Some((t,dist))=lv.traj.locate([w.0,w.1],lv.clock,SYNC_WINDOW,SYNC_WEIGHT){
+          if dist<=SYNC_MAX_DIST{lv.sync=Some((t,at));}
+        }
+      }
+    }
+    if !held{
+      let mut rate=1.0f32;
+      if let Some((t,at))=lv.sync{
+        let machine_now=t+(now-at).as_secs_f32()*speed;
+        let err=machine_now-lv.clock;
+        if err.abs()>SYNC_SNAP{lv.clock=machine_now.max(0.0);}else{rate=(1.0+err/SYNC_TAU).clamp(0.0,3.0);}
+      }
+      lv.clock+=elapsed*speed*rate;
+    }
     let s=lv.traj.sample(lv.clock);
     lv.head=(lv.origin.0+s.pos[0],lv.origin.1+s.pos[1]);
     lv.progress=s.segment;
@@ -1665,5 +1705,5 @@ impl eframe::App for LaserApp {
 // =============================================================================
 // End of file: app.rs
 // Location:    laser-cnc-controller/src/app.rs
-// Created:     2026-10-17 18:43:10 UTC
+// Created:     2026-10-17 22:04:20 UTC
 // =============================================================================

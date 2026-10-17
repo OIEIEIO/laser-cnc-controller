@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     machine.rs
 // Location: laser-cnc-controller/src/machine.rs
-// Version:  v0.1.6
+// Version:  v0.1.7
 // Comments: GRBL 0.9i serial transport.
 //           v0.1.1:
 //           - Machine state word parsed from status reports (<Run,...>,
@@ -44,6 +44,9 @@
 //             changeable during a run. sim_laser() reports its laser state.
 //           v0.1.6: sim_laser() removed (the app takes the laser state from
 //           its motion-planner trajectory in both live and Simulate runs).
+//           v0.1.7: status_seq counts status reports and status_at holds the
+//           time of the last one, so the app can tell a new position report
+//           from a repeated read (live-view clock sync, app v0.2.3).
 // =============================================================================
 use std::collections::VecDeque;
 use std::io::{Read,Write};
@@ -125,9 +128,11 @@ pub struct Machine {
     pub job_errors:usize, pub job_error:Option<String>, pub alarm:Option<String>,
     pub journal:Vec<String>, pub firmware:Option<String>, pub info:ControllerInfo,
     pub reset_count:u32,
+    /// Number of status reports received, and when the last one arrived.
+    pub status_seq:u32, pub status_at:Option<Instant>,
     pub simulate:bool, pub sim_speed:f32, sim:Option<SimShared>,
 }
-impl Default for Machine {fn default()->Self{Self{worker:None,link:Link::Disconnected,ports:vec![],selected_port:String::new(),baud:115200,log:vec![],status:"Disconnected".into(),state:String::new(),position:(0.0,0.0),next_line:0,running:false,acknowledged:0,error:None,error_line:None,job_errors:0,job_error:None,alarm:None,journal:vec![],firmware:None,info:ControllerInfo::default(),reset_count:0,simulate:false,sim_speed:1.0,sim:None}}}
+impl Default for Machine {fn default()->Self{Self{worker:None,link:Link::Disconnected,ports:vec![],selected_port:String::new(),baud:115200,log:vec![],status:"Disconnected".into(),state:String::new(),position:(0.0,0.0),next_line:0,running:false,acknowledged:0,error:None,error_line:None,job_errors:0,job_error:None,alarm:None,journal:vec![],firmware:None,info:ControllerInfo::default(),reset_count:0,status_seq:0,status_at:None,simulate:false,sim_speed:1.0,sim:None}}}
 impl Machine {
     pub fn refresh(&mut self){if let Ok(ports)=serialport::available_ports(){self.ports=ports.into_iter().map(|p|p.port_name).collect();if self.selected_port.is_empty(){if let Some(s)=self.ports.first(){self.selected_port=s.clone();}}}}
     pub fn connected(&self)->bool{self.link==Link::Connected}
@@ -264,6 +269,7 @@ impl Machine {
         self.info.mpos=triple(s,"MPos:");
         self.info.wpos=triple(s,"WPos:");
         if let Some(p)=self.info.wpos.or(self.info.mpos){self.position=(p.0,p.1);}
+        self.status_seq=self.status_seq.wrapping_add(1);self.status_at=Some(Instant::now());
     }
     /// Sort $I / $G / $# / $$ replies into `info`.
     fn classify(&mut self,s:&str){
@@ -427,5 +433,5 @@ impl Worker{
 // =============================================================================
 // End of file: machine.rs
 // Location:    laser-cnc-controller/src/machine.rs
-// Created:     2026-10-16 21:27:22 UTC
+// Created:     2026-10-17 22:04:20 UTC
 // =============================================================================

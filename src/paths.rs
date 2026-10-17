@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     paths.rs
 // Location: laser-cnc-controller/src/paths.rs
-// Version:  v0.1.0
+// Version:  v0.1.1
 // Comments: Burn-path engine (app v0.2.1): turns one shape into the strokes
 //           the laser burns, and merges shapes into one outline.
 //           Polygon offsets and unions use the geo crate (BooleanOps, Buffer).
@@ -33,6 +33,14 @@
 //           Merge: shapes qualify when they share an edge of non-zero length
 //           or overlap; corner-only contact and gaps do not. Coordinates are
 //           rounded to 0.0001 mm first so snapped edges count as shared.
+//           v0.1.1 (app v0.2.3): every pass is cleaned before it is emitted:
+//           points closer than 0.05 mm to the previous kept point are dropped
+//           (the end point is always kept), then points that deviate less than
+//           0.002 mm from a straight line are removed (Ramer-Douglas-Peucker).
+//           Round corners, small circles and offset arcs no longer produce
+//           runs of 0.006 mm moves that GRBL 0.9 cannot parse and plan as fast
+//           as the planner model assumes. Passes shorter than 0.001 mm are
+//           dropped.
 // =============================================================================
 use geo::{BooleanOps, Buffer, Coord, LineString, MultiPolygon, Polygon};
 use geo::algorithm::buffer::{BufferStyle, LineCap, LineJoin};
@@ -54,6 +62,9 @@ const CIRCLE_TOL: f64 = 0.002;
 const MIN_SEG: f64 = 0.001;
 /// Merge: coordinates rounded to this grid, mm.
 const MERGE_GRID: f64 = 1e-4;
+/// Pass cleanup: shortest kept move, and largest deviation from a straight line removed, mm.
+const MIN_STEP: f64 = 0.05;
+const STRAIGHT_TOL: f64 = 0.002;
 
 /// One continuous laser-on pass. `closed` passes end where they start (no overscan).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -329,6 +340,40 @@ fn rails(path: &[P], closed: bool, half: f64, pitch: f64, clip: &MP, bidir: bool
     }
     out
 }
+/// Ramer-Douglas-Peucker: keep the points that deviate more than `tol` from the chord.
+fn rdp(pts: &[P], tol: f64, out: &mut Vec<P>) {
+    let n = pts.len();
+    if n < 3 { return; }
+    let (a, b) = (pts[0], pts[n - 1]);
+    let ab = sub(b, a);
+    let l = len(ab);
+    let mut far = (0usize, 0.0f64);
+    for (i, &p) in pts.iter().enumerate().take(n - 1).skip(1) {
+        let d = if l > 1e-12 { (cross(ab, sub(p, a)) / l).abs() } else { len(sub(p, a)) };
+        if d > far.1 { far = (i, d); }
+    }
+    if far.1 > tol {
+        rdp(&pts[..=far.0], tol, out);
+        out.push(pts[far.0]);
+        rdp(&pts[far.0..], tol, out);
+    }
+}
+/// Clean one pass: drop moves shorter than MIN_STEP (the end point is kept), then remove points
+/// within STRAIGHT_TOL of a straight line. Closed passes keep their closing point.
+fn clean(pts: &[Pt]) -> Vec<Pt> {
+    if pts.len() <= 2 { return pts.to_vec(); }
+    let p: Vec<P> = pts.iter().map(|&q| f64p(q)).collect();
+    let last = p[p.len() - 1];
+    let mut kept: Vec<P> = vec![p[0]];
+    for &q in &p[1..p.len() - 1] { if len(sub(q, kept[kept.len() - 1])) >= MIN_STEP { kept.push(q); } }
+    // The end point replaces a kept point that sits closer than MIN_STEP to it.
+    if kept.len() > 1 && len(sub(last, kept[kept.len() - 1])) < MIN_STEP { kept.pop(); }
+    kept.push(last);
+    let mut out = vec![kept[0]];
+    rdp(&kept, STRAIGHT_TOL, &mut out);
+    out.push(last);
+    out.into_iter().map(f32p).collect()
+}
 /// Number of parallel lines in a trace or border of width w at the given density (at least 1).
 pub fn line_count(w: f32, lpm: f32) -> usize { ((w as f64 * lpm as f64).round() as usize).max(1) }
 fn trace(path: &[P], s: &Shape, bidir: bool) -> Vec<Stroke> {
@@ -389,6 +434,8 @@ pub fn shape_strokes(s: &Shape) -> Vec<Stroke> {
         }
         if matches!(s.operation, Operation::Fill | Operation::Both) { out.extend(fill(&interior, s, bidir)); }
     }
+    for st in &mut out { st.pts = clean(&st.pts); }
+    out.retain(|st| st.pts.len() >= 2 && st.pts.windows(2).map(|w| len(sub(f64p(w[1]), f64p(w[0])))).sum::<f64>() > MIN_SEG);
     let ov = s.overscan.max(0.0);
     if ov > 1e-4 {
         for st in &mut out {
@@ -555,6 +602,25 @@ mod tests {
     }
 
     #[test]
+    fn passes_have_no_tiny_moves() {
+        // Round-cornered polyline trace: offset arcs near the centerline have very short chords.
+        let mut s = Shape::polyline(vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 12.0)], false);
+        s.width = 1.0; s.join = Join::Round;
+        let st = shape_strokes(&s);
+        assert!(!st.is_empty());
+        for p in &st {
+            let n = p.pts.len();
+            for (k, w) in p.pts.windows(2).enumerate() {
+                let d = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+                // Interior moves at least MIN_STEP; only the last move may be shorter.
+                assert!(d >= 0.0499 || k == n - 2, "move {d} mm");
+            }
+        }
+        // A straight run of collinear points becomes one move.
+        assert_eq!(clean(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)]), vec![(0.0, 0.0), (3.0, 0.0)]);
+    }
+
+    #[test]
     fn overscan_leads() {
         let mut s = rect(0.0, 0.0, 10.0, 1.0);
         s.lines_per_mm = 1.0; s.overscan = 2.0;
@@ -566,5 +632,5 @@ mod tests {
 // =============================================================================
 // End of file: paths.rs
 // Location:    laser-cnc-controller/src/paths.rs
-// Created:     2026-10-17 17:35:38 UTC
+// Created:     2026-10-17 22:04:20 UTC
 // =============================================================================

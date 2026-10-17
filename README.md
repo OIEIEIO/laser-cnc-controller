@@ -2,7 +2,7 @@
 =============================================================================
 File:     README.md
 Location: laser-cnc-controller/README.md
-Version:  v0.2.2
+Version:  v0.2.3
 Comments: Project overview, build, controls and limitations.
           v0.1.4: project management, run records, daily log, Runs panel,
           Shape Properties dock slot in the canvas tool strip.
@@ -29,9 +29,11 @@ Comments: Project overview, build, controls and limitations.
           built-in examples, calibration pattern generator.
           v0.2.2: Projects and Active Project panels; burn / travel time in
           Job Details; run countdown on the canvas.
+          v0.2.3: live view synced to the controller's position reports;
+          burn passes cleaned of moves shorter than 0.05 mm.
 =============================================================================
 -->
-# Laser CNC Controller — v0.2.2
+# Laser CNC Controller — v0.2.3
 
 Local geometry editor, G-code generator, simulator and GRBL 0.9i serial controller for a 2-axis (XY) desktop diode-laser gantry. Laser power is controlled with GRBL's spindle commands: `M3 S<value>` on, `M5` off.
 
@@ -214,6 +216,7 @@ New shapes go on the layer chosen in the tool strip; Shape Properties moves a sh
   - **Interior:** fill **None / Horizontal / Vertical / Crosshatch / Concentric**, density. With a border: **Abut** (starts at the border's inner edge), **Overlap** (extends into the border by the given mm), **Gap** (unburned ring of the given mm).
   - Raster line positions are unchanged from v0.2.0: from one edge to the other, both edges included.
 - **Raster:** **Bidirectional** (alternate passes reverse) or **Unidirectional** (travel back between passes). **Overscan** (mm): laser-off lead-in and lead-out at the burn feed along every open pass: `G0` to the lead-in, `G1` laser off to the pass start, `M3`, burn, `M5`, `G1` laser off to the lead-out. Drawn amber on the canvas.
+- **Pass cleanup (v0.2.3).** Every pass drops moves shorter than 0.05 mm (the end point is kept) and points within 0.002 mm of a straight line. Round corners, small circles and offset arcs used to produce runs of ~0.006 mm moves, which GRBL 0.9 cannot parse and plan as fast as the motion model assumes.
 - **Outline passes are one closed loop.** v0.2.0 burned each rectangle edge and each circle segment with its own `M5` / `G0` / `M3`; v0.2.1 burns the loop continuously.
 - Selected traces and bordered shapes show their burned extent as a dashed outline.
 
@@ -237,7 +240,9 @@ Every committed edit (canvas, Shape Properties, origin, fence, merge, order) is 
 
 **Shape Properties** is the top panel of the right column. Sections: layer; geometry (rectangle X/Y/W/H, line start/end, circle centre/diameter, polyline / merged outline position, size, closed flag; text string, height, position, font); Trace; Border and Interior; Raster; Process (feed, power, passes); Burn order. Line and border counts are shown read-only (e.g. "20 (2.00 mm × 10.0 lines/mm)").
 
-During a Job or Trace run the canvas shows the run live: the run's path, green where done, a segment to the head, and the head marker. At Start the streamed lines are planned by the motion planner (acceleration, corners, a full stop at every `M3`/`M5`, look-ahead 18 blocks) from the head's WPos at that moment. A run clock then places the head on that trajectory every frame, so it moves at the planned speeds and follows every corner. The clock runs at the Simulate speed in Simulate and stops while the controller reports Hold, Door or Alarm. The head marker and its segment are **red while the laser is on** and **yellow while it is off**, from the trajectory. The marker is a model of the machine, not a measurement: GRBL 0.9 reports no executing line, and its position reports (every 250 ms) are not used for the marker.
+During a Job or Trace run the canvas shows the run live: the run's path, green where done, a segment to the head, and the head marker. At Start the streamed lines are planned by the motion planner (acceleration, corners, a full stop at every `M3`/`M5`, look-ahead 18 blocks) from the head's WPos at that moment. A run clock then places the head on that trajectory every frame, so it moves at the planned speeds and follows every corner. The clock runs at the Simulate speed in Simulate and stops while the controller reports Hold, Door or Alarm. The head marker and its segment are **red while the laser is on** and **yellow while it is off**, from the trajectory. The marker is a model of the machine, not a measurement: GRBL 0.9 reports no executing line, and its position reports are used only to keep the clock in step (below).
+
+**Sync to position reports (v0.2.3).** Each status report (every 250 ms) is located on the planned trajectory near the run clock (the nearest point within ±4 s, with a small preference for points close in time so neighbouring raster passes 0.1 mm apart do not swap). The machine's time is that point plus the time since the report. The clock then runs faster or slower than real time to close the difference within about 0.6 s; a difference over 3 s is taken at once. Reports farther than 2 mm from the path near the clock are ignored (for example the head before motion starts). The marker, done path, laser colour and countdown all follow the corrected clock, so they stay within one report interval of the controller. Position reports are GRBL's step counts: steps lost by the motors are not seen.
 
 **Run countdown.** During a Job or Trace run (machine or Simulate) a large timer sits in the canvas's top-right corner: time remaining, a progress bar, elapsed and total. It follows the same run clock as the head marker, so it is planned machine time: it runs at the Simulate speed in Simulate and stops while the controller reports Hold, Door (shown as PAUSED) or Alarm. On the machine it is a prediction from the planner; comparing it with the real end of a run checks the planner timing.
 
@@ -304,11 +309,11 @@ The UI follows the operating system's scaling. egui zoom: **Ctrl + Plus / Ctrl +
 - `src/machine.rs` — GRBL serial worker thread, buffered (character-counting) streaming, connect handshake, controller info, command journal, Port (serial / virtual)
 - `src/vgrbl.rs` — virtual GRBL 0.9i for Simulate
 - `src/storage.rs` — redb persistence (projects, runs)
-- `crates/motion-planner/` — `no_std` motion planner crate (workspace member): `src/lib.rs` kinematics, junction deviation, trapezoid profiles, look-ahead planner, trajectory sampling; `src/gcode.rs` G-code lines to planner blocks. `cargo test --workspace` runs its tests.
+- `crates/motion-planner/` — `no_std` motion planner crate (workspace member, v0.1.1): `src/lib.rs` kinematics, junction deviation, trapezoid profiles, look-ahead planner, trajectory sampling, time at a distance, locating a position on a trajectory; `src/gcode.rs` G-code lines to planner blocks. `cargo test --workspace` runs its tests.
 <!--
 =============================================================================
 End of file: README.md
 Location:    laser-cnc-controller/README.md
-Created:     2026-10-17 18:43:10 UTC
+Created:     2026-10-17 22:04:20 UTC
 =============================================================================
 -->

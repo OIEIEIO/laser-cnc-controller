@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     lib.rs
 // Location: laser-cnc-controller/crates/motion-planner/src/lib.rs
-// Version:  v0.1.0
+// Version:  v0.1.1
 // Comments: no_std motion planner modelled on GRBL 0.9's planner.
 //           Units: millimetres, seconds, mm/s, mm/s². Feed and max rate are
 //           given in mm/min (G-code and GRBL $110/$111 units) and converted.
@@ -24,6 +24,15 @@
 //           - gcode module: G-code lines to Blocks.
 //           Hypotheses until checked against the GRBL 0.9 source / machine:
 //           look-ahead depth 18 blocks; full stop on every M3/M4/M5 line.
+//           v0.1.1:
+//           - Profile::time_at(d): time at which a move has covered distance
+//             d (inverse of Profile::at).
+//           - Trajectory::locate(pos, around, window, weight): the time on the
+//             trajectory whose position is nearest to a reported position,
+//             searched within around ± window seconds; candidates further in
+//             time from `around` cost `weight` mm per second, so parallel
+//             passes close together do not swap. Used to keep an animation
+//             clock in step with the controller's position reports.
 // =============================================================================
 #![no_std]
 #[cfg(feature = "alloc")]
@@ -246,6 +255,29 @@ impl Profile {
         }
         (self.length, self.exit)
     }
+    /// Time (s) at which the move has covered distance `d` (clamped to the move). Inverse of `at`.
+    pub fn time_at(&self, d: f32) -> f32 {
+        let d = d.clamp(0.0, self.length);
+        // Within a ramp: d = v0·τ + ½·k·τ², solved for τ.
+        let ramp = |d: f32, dur: f32, v0: f32, v1: f32| -> f32 {
+            if dur <= 0.0 {
+                return 0.0;
+            }
+            let k = (v1 - v0) / dur;
+            if k.abs() < 1e-9 {
+                return if v0 > 0.0 { (d / v0).min(dur) } else { 0.0 };
+            }
+            ((-v0 + sqrt(v0 * v0 + 2.0 * k * d)) / k).clamp(0.0, dur)
+        };
+        if d <= self.d_accel {
+            return ramp(d, self.t_accel, self.entry, self.cruise);
+        }
+        let d2 = d - self.d_accel;
+        if d2 <= self.d_cruise {
+            return self.t_accel + if self.cruise > 0.0 { d2 / self.cruise } else { 0.0 };
+        }
+        self.t_accel + self.t_cruise + ramp(d2 - self.d_cruise, self.t_decel, self.cruise, self.exit)
+    }
 }
 
 /// One move handed to the planner (program coordinates).
@@ -326,6 +358,35 @@ impl Trajectory {
             *p += s.kin.unit[k] * d;
         }
         Sample { pos, speed: v, segment: i, laser: s.block.laser, done: false }
+    }
+    /// Time on the trajectory whose position is nearest to `pos`, searched within `around` ± `window`
+    /// seconds. Cost of a candidate = distance (mm) + `weight` × |time − around| (mm/s), so of two
+    /// equally near points the one closer in time wins. Returns (time, distance) or None when no
+    /// move lies in the window.
+    pub fn locate(&self, pos: [f32; AXES], around: f32, window: f32, weight: f32) -> Option<(f32, f32)> {
+        let (t0, t1) = (around - window, around + window);
+        let first = self.segments.partition_point(|s| s.t_start + s.profile.duration() < t0);
+        let mut best: Option<(f32, f32, f32)> = None;
+        for s in self.segments[first..].iter().take_while(|s| s.t_start <= t1) {
+            // Nearest point on the move's line, as distance along it.
+            let mut along = 0.0f32;
+            for k in 0..AXES {
+                along += (pos[k] - s.block.start[k]) * s.kin.unit[k];
+            }
+            let along = along.clamp(0.0, s.kin.length);
+            let mut sq = 0.0f32;
+            for k in 0..AXES {
+                let p = s.block.start[k] + s.kin.unit[k] * along;
+                sq += (pos[k] - p) * (pos[k] - p);
+            }
+            let dist = sqrt(sq);
+            let t = (s.t_start + s.profile.time_at(along)).clamp(t0.max(0.0), t1);
+            let cost = dist + weight * (t - around).abs();
+            if best.is_none_or(|b| cost < b.2) {
+                best = Some((t, dist, cost));
+            }
+        }
+        best.map(|b| (b.0, b.1))
     }
 }
 
@@ -501,6 +562,34 @@ mod tests {
     }
 
     #[test]
+    fn time_at_inverts_at() {
+        let p = profile(20.0, 0.0, 10.0, 0.4913, 10.0);
+        for i in 0..=40 {
+            let d = 20.0 * i as f32 / 40.0;
+            let (dd, _) = p.at(p.time_at(d));
+            assert!(close(dd, d, 1e-3), "d {d} -> {dd}");
+        }
+    }
+
+    #[test]
+    fn locate_finds_the_reported_point_and_prefers_nearby_time() {
+        // Two parallel passes 0.1 mm apart, one after the other.
+        let mut back = block([20.0, 0.1], [0.0, 0.1], 600.0);
+        back.stop_before = true;
+        let t = plan(&cfg(), &[block([0.0, 0.0], [20.0, 0.0], 600.0), back]);
+        let mid = t.segments[0].profile.duration() * 0.5;
+        let s = t.sample(mid);
+        let (found, dist) = t.locate(s.pos, mid, 5.0, 0.02).unwrap();
+        assert!(close(found, mid, 1e-3) && dist < 1e-4);
+        // A point on the second pass, searched around a time on the first pass that is
+        // close in position: the time weight keeps the first pass unless the distance says otherwise.
+        let second = t.segments[1].t_start + 0.5;
+        let p2 = t.sample(second).pos;
+        let (f2, _) = t.locate(p2, second - 0.2, 5.0, 0.02).unwrap();
+        assert!(close(f2, second, 0.02));
+    }
+
+    #[test]
     fn settings_from_grbl() {
         let lines = ["$11=0.020 (junction deviation, mm)", "$110=5000.000 (x max rate, mm/min)", "$121=250.000 (y accel, mm/sec^2)", "$999=x"];
         let c = MotionConfig::default().with_grbl_settings(lines.iter().copied());
@@ -522,5 +611,5 @@ mod tests {
 // =============================================================================
 // End of file: lib.rs
 // Location:    laser-cnc-controller/crates/motion-planner/src/lib.rs
-// Created:     2026-10-16 21:27:22 UTC
+// Created:     2026-10-17 22:04:20 UTC
 // =============================================================================

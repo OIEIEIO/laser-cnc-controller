@@ -1,7 +1,7 @@
 # =============================================================================
 # File:     Cargo.toml
 # Location: laser-cnc-controller/Cargo.toml
-# Version:  v0.2.2
+# Version:  v0.2.3
 # Comments: Package manifest. v0.1.4: project management, run records, daily log.
 #           v0.1.5: threaded LaserGRBL-style buffered streaming, connection
 #           info, Unlock, manual command line. No dependency changes.
@@ -22,10 +22,13 @@
 #           outline-font text. geo 0.33 needs Rust 1.88 or newer.
 #           v0.2.2: Projects / Active Project panels, burn / travel time in Job
 #           Details, run countdown on the canvas. No dependency changes.
+#           v0.2.3: live view synced to controller position reports; passes
+#           cleaned of moves under 0.05 mm. motion-planner 0.1.1. No new
+#           dependencies.
 # =============================================================================
 [package]
 name = "laser-cnc-controller"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Local laser CNC geometry editor and GRBL 0.9i controller"
 
@@ -46,5 +49,5 @@ epaint_default_fonts = "0.31.1"
 # =============================================================================
 # End of file: Cargo.toml
 # Location:    laser-cnc-controller/Cargo.toml
-# Created:     2026-10-17 18:43:10 UTC
+# Created:     2026-10-17 22:04:20 UTC
 # =============================================================================
