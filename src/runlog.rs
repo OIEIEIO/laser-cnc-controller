@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     runlog.rs
 // Location: laser-cnc-controller/src/runlog.rs
-// Version:  v0.1.2
+// Version:  v0.1.3
 // Comments: Burn records, daily machine log and G-code export.
 //           Data folder (visible): ~/LaserCNC  (Windows: %USERPROFILE%\LaserCNC)
 //             override with LASER_CNC_HOME=/path
@@ -17,6 +17,8 @@
 //           older "Frame" records keep their names.
 //           v0.1.2: `simulated` flag (Simulate mode runs, tagged SIM; folder
 //           suffix _sim).
+//           v0.1.3: estimate_s is the planned time (acceleration, corners,
+//           M3/M5 stops) from app v0.2.0; comment only, no format change.
 // =============================================================================
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -89,7 +91,7 @@ pub struct RunRecord {
     pub started: String,         // local "YYYY-MM-DD HH:MM:SS"
     pub ended: String,
     pub duration_s: f32,
-    pub estimate_s: f32,         // constant-speed lower bound (Job only)
+    pub estimate_s: f32,         // planned time (Job only); v0.1.x records: constant-speed lower bound
     pub outcome: String,         // Running | Completed | Reset | Error | Disconnected
     pub error: Option<String>,
     pub error_line: Option<usize>, // 1-based program line rejected by GRBL
@@ -162,5 +164,5 @@ impl ActiveRun {
 // =============================================================================
 // End of file: runlog.rs
 // Location:    laser-cnc-controller/src/runlog.rs
-// Created:     2026-10-13 17:54:31 UTC
+// Created:     2026-10-16 21:27:22 UTC
 // =============================================================================

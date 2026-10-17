@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     app.rs
 // Location: laser-cnc-controller/src/app.rs
-// Version:  v0.1.9
+// Version:  v0.2.2
 // Comments: Application shell: theme, panels, machine-control row, project
 //           management, run recording, simulation timing, G-code monitor.
 //           - Fixed machine-control row under the File/Help line, in job order:
@@ -96,34 +96,107 @@
 //             at startup and applied to every project (new, opened, closed).
 //             Defaults 380 x 280 mm, 2500 mm/min, S1000. Profile values are
 //             left out of the unsaved-changes comparison.
+//           v0.2.0 (motion-planner crate):
+//           - Motion settings: $110/$111 max rate, $120/$121 acceleration,
+//             $11 junction deviation from the controller's $$ while connected;
+//             otherwise from the Machine Profile (new fields, defaults 3000 /
+//             3000 mm/min, 10 / 10 mm/s², 0.010 mm). Look-ahead 18 blocks.
+//             The program is re-planned when the source or values change.
+//           - Live run view (Job and Trace, real and Simulate): the streamed
+//             lines are planned into a trajectory at Start, from the head's
+//             WPos at that moment. The head marker, the done path and the
+//             laser colour follow a run clock along that trajectory, so the
+//             marker moves smoothly at the planned speeds and follows every
+//             corner. The clock runs at the Simulate speed in Simulate, and
+//             stops while the controller reports Hold, Door or Alarm.
+//             Replaces following the smoothed 250 ms WPos reports.
+//           - Job Details estimate: planned with acceleration, corners and the
+//             stops at M3/M5 (src/gcode.rs).
+//           v0.2.1 (canvas CAD update):
+//           - Canvas Tools is a panel (id 7, "Canvas Tools"): docked above the
+//             canvas in two rows, collapsible to its title bar, or floating
+//             in a resizable window where the tool groups wrap to the window
+//             width. Layout key v5 (floating flags reset once).
+//           - Undo / redo: every committed project edit (canvas, Shape
+//             Properties, origin, fence) is one step; drags commit when they
+//             end. Tool strip buttons, Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z.
+//             History is cleared on New / Open / Close / Duplicate. Project
+//             name, id and read-only flag are not part of the history.
+//           - Shape Properties rewritten: layer; geometry per kind (rectangle,
+//             line, circle, polyline, merged region, text); Trace (width,
+//             along / across, density, line count, end cap, corners); Border
+//             (width, alignment, direction, density, line count) and
+//             Interior (outline pass, fill pattern or none, density,
+//             relation abut / overlap / gap); Raster (bi- / unidirectional,
+//             overscan); Process; Burn order (first / earlier / later /
+//             last). Text: string, height, font, leader, detach, convert to
+//             geometry. Notes attached to a shape move with it when its
+//             position fields change.
+//           - Built-in read-only examples (src/examples.rs) written to redb at
+//             every start. Opening one is read-only: any edit is undone and a
+//             prompt offers Duplicate (Save As copy, editable). Save / Save As
+//             on an example duplicate it. Examples cannot be deleted and their
+//             names cannot be used by Save As.
+//           - File > New calibration pattern…: power × feed matrix, line
+//             density, fill direction, overscan; on the 50 × 100 mm tape or
+//             free; creates an unsaved project.
+//           - Opening a project fits its shapes in view. Trace Job uses Burn
+//             layer shapes only. Job Details counts shapes per layer.
+//           - Comparable project JSON (unsaved marker, history) leaves out
+//             name, id and read-only as well as the Machine Profile fields.
+//           v0.2.2:
+//           - Projects split in two left-column panels: Projects (saved
+//             projects dropdown, Open, Delete) and Active Project (open
+//             project name and state, New / Save / Save As / Duplicate /
+//             Close / Export G-code, Job Details, Run History). Each
+//             collapses and floats on its own. Active Project is expanded on
+//             first launch. Layout key v6 (floating flags reset once).
+//           - The Saved projects dropdown returns to "Saved projects…" after
+//             Open, so it never shows a name that is not the open project.
+//           - Job Details: Engraving and Travel show distance and planned
+//             time; Estimated is their sum (src/gcode.rs).
+//           - Live runs (Job and Trace, machine and Simulate) pass the run
+//             clock and the trajectory duration to the canvas countdown.
 // =============================================================================
 use eframe::egui::{self,Color32,CornerRadius,Stroke,Vec2};
 use eframe::egui::collapsing_header::CollapsingState;
 use serde::{Deserialize,Serialize};
-use crate::geometry::{self,Project,ShapeKind,Fill,Operation};
+use crate::geometry::{self,Align,Cap,Fill,Join,Layer,Operation,Project,Relation,Shape,ShapeKind,StrokeDir,TextFont};
 use crate::gcode::{self,Move,Plan};
 use crate::storage::Store;
 use crate::machine::{Link,Machine};
-use crate::canvas::{CanvasView,SimOverlay};
+use crate::canvas::{self,CanvasView,Events,SimOverlay};
+use crate::examples::{self,CalKind,CalParams};
+use crate::paths;
 use crate::runlog::{self,ActiveRun,RunRecord};
 use crate::widgets;
+use motion_planner::{MotionConfig,Trajectory};
 use std::time::Instant;
 
 #[derive(Clone,Copy,Default,Serialize,Deserialize)]
 struct Panel { floating:bool }
 
-const TITLES:[&str;7]=["Serial Communications","Projects","Shape Properties","Machine Profile","Jog Controls","G-code / Stream","Runs"];
-const LEFT_DOCK:[usize;4]=[0,1,3,6];
+const TITLES:[&str;9]=["Serial Communications","Projects","Shape Properties","Machine Profile","Jog Controls","G-code / Stream","Runs","Canvas Tools","Active Project"];
+const LEFT_DOCK:[usize;5]=[0,1,8,3,6];
 const RIGHT_DOCK:[usize;3]=[2,4,5];
 const PROPS:usize=2;
-const LAYOUT_KEY:&str="panel_layout_v4";
+const TOOLS:usize=7;
+const ACTIVE:usize=8;
+const LAYOUT_KEY:&str="panel_layout_v6";
+/// Undo steps kept.
+const HISTORY:usize=200;
 const PROFILE_KEY:&str="machine_profile_v1";
 
 /// Machine Profile: a property of the machine, saved with the app settings.
+/// Motion fields ($110/$111, $120/$121, $11) are used when the controller's $$ is not available.
 #[derive(Clone,Copy,PartialEq,Serialize,Deserialize)]
 #[serde(default)]
-struct MachineProfile{work_x:f32,work_y:f32,travel_feed:f32,max_power:u32}
-impl Default for MachineProfile{fn default()->Self{Self{work_x:380.0,work_y:280.0,travel_feed:2500.0,max_power:1000}}}
+struct MachineProfile{work_x:f32,work_y:f32,travel_feed:f32,max_power:u32,
+  max_rate_x:f32,max_rate_y:f32,accel_x:f32,accel_y:f32,junction_dev:f32}
+impl Default for MachineProfile{fn default()->Self{Self{work_x:380.0,work_y:280.0,travel_feed:2500.0,max_power:1000,
+  max_rate_x:3000.0,max_rate_y:3000.0,accel_x:10.0,accel_y:10.0,junction_dev:0.010}}}
+/// Planner look-ahead in blocks (GRBL 0.9 block buffer; hypothesis until checked against planner.h).
+const LOOKAHEAD:usize=18;
 const SIM_SPEEDS:[f32;5]=[1.0,2.0,5.0,10.0,50.0];
 const FENCE_EPS:f32=0.001;
 
@@ -131,12 +204,17 @@ const FENCE_EPS:f32=0.001;
 #[derive(Clone,Copy,PartialEq)]
 enum TraceTarget{Part,Job,Fence}
 
-/// Live view of a Job or Trace run: its path in canvas coordinates and progress along it.
-struct LiveView{path:Vec<Move>,origin:(f32,f32),progress:usize,head:Option<(f32,f32)>}
+/// Live view of a Job or Trace run: the planned trajectory of the streamed lines (program
+/// coordinates), its moves in canvas coordinates for drawing, and the run clock.
+struct LiveView{traj:Trajectory,path:Vec<Move>,origin:(f32,f32),start:(f32,f32),clock:f32,last:Instant,
+  progress:usize,head:(f32,f32),laser:bool}
 
 /// Project action that may need an unsaved-changes prompt first.
-#[derive(Clone,PartialEq)]
-enum Pending{New,Open(String),Close}
+#[derive(Clone)]
+enum Pending{New,Open(String),Close,Load(Box<Project>)}
+/// Burn order change from Shape Properties.
+#[derive(Clone,Copy)]
+enum OrderMove{First,Earlier,Later,Last}
 
 /// Modal dialogs.
 enum Dialog{
@@ -146,19 +224,24 @@ enum Dialog{
   ConfirmDelete{name:String},
   Unsaved{then:Pending},
   Notice{title:String,msg:String},
+  ReadOnly,
+  Calibration{params:CalParams,error:String},
 }
 
 pub struct LaserApp {
     project:Project, plan:Plan, store:Option<Store>, machine:Machine,
     view:CanvasView, selected:Vec<usize>, props_last_sel:Vec<usize>,
-    panels:[Panel;7],
-    last_frame:Instant,
+    panels:[Panel;9],
     spot_power:u32,frame_feed:f32,spot_on:bool,trace_target:TraceTarget,monitor_follow:usize,
     max_power:u32, profile:MachineProfile, project_active:bool, saved_once:bool, saved_json:String, dirty:bool, last_title:String,
     dialog:Dialog, saved_names:Vec<String>, project_to_load:String, notice:String, job_lines:Vec<String>,
     runs:Vec<RunRecord>, selected_run:Option<String>, notes_edit:String, active_run:Option<ActiveRun>,
     manual_cmd:String,
     zero_x:bool, zero_y:bool, seen_resets:u32, live:Option<LiveView>, jog_pred:Option<(f32,f32)>, last_jog:Option<Instant>,
+    motion:MotionConfig,
+    // Undo history: `hist` is the last committed project; `undo` / `redo` hold earlier / undone states.
+    undo:Vec<Project>, redo:Vec<Project>, hist:Project, hist_json:String,
+    builtin_names:Vec<String>, cal_params:CalParams,
 }
 
 impl LaserApp {
@@ -195,38 +278,91 @@ impl LaserApp {
     cc.egui_ctx.set_style(style);
 
     // ---- Restore floating/docked layout from the last session ----
-    let mut panels=[Panel::default();7];
-    if let Some(storage)=cc.storage {if let Some(saved)=eframe::get_value::<[Panel;7]>(storage,LAYOUT_KEY){panels=saved;}}
+    let mut panels=[Panel::default();9];
+    if let Some(storage)=cc.storage {if let Some(saved)=eframe::get_value::<[Panel;9]>(storage,LAYOUT_KEY){panels=saved;}}
     // ---- Machine Profile from the user settings (defaults 380 x 280) ----
     let profile=cc.storage.and_then(|s|eframe::get_value::<MachineProfile>(s,PROFILE_KEY)).unwrap_or_default();
 
-    let (store,err)=match Store::open(){Ok(s)=>(Some(s),String::new()),Err(e)=>(None,format!("Database unavailable: {e}"))};
+    let (store,mut err)=match Store::open(){Ok(s)=>(Some(s),String::new()),Err(e)=>(None,format!("Database unavailable: {e}"))};
+    // Built-in examples: written at every start (read-only, fixed ids).
+    let builtins=examples::builtin();
+    let builtin_names:Vec<String>=builtins.iter().map(|p|p.name.clone()).collect();
+    if let Some(s)=&store{for p in &builtins{if let Err(e)=s.save(p){err=format!("Examples not written: {e}");}}}
     let mut project=Project::blank();
     project.work_x=profile.work_x;project.work_y=profile.work_y;project.travel_feed=profile.travel_feed;
     let saved_json=Self::comparable_json(&project);
     let (mut names,mut runs)=(vec![],vec![]);
     if let Some(s)=&store {names=s.names().unwrap_or_default();runs=s.runs().unwrap_or_default();}
-    let plan=gcode::generate(&project,profile.max_power);
     let mut machine=Machine::default();machine.refresh();
+    let motion=Self::motion_config(&profile,&machine);
+    let plan=gcode::generate(&project,profile.max_power,&motion);
+    let hist=project.clone();let hist_json=Self::comparable_json(&project);
     Self {project,plan,store,machine,view:CanvasView::default(),selected:vec![],props_last_sel:vec![],
       panels,
-      last_frame:Instant::now(),
       spot_power:2,frame_feed:1200.0,spot_on:false,trace_target:TraceTarget::Job,monitor_follow:usize::MAX,max_power:profile.max_power,profile,
       project_active:false,saved_once:false,saved_json,dirty:false,last_title:String::new(),
       dialog:Dialog::None,saved_names:names,project_to_load:String::new(),notice:err,job_lines:vec![],
       runs,selected_run:None,notes_edit:String::new(),active_run:None,manual_cmd:String::new(),
-      zero_x:false,zero_y:false,seen_resets:0,live:None,jog_pred:None,last_jog:None}
+      zero_x:false,zero_y:false,seen_resets:0,live:None,jog_pred:None,last_jog:None,motion,
+      undo:vec![],redo:vec![],hist,hist_json,builtin_names,cal_params:CalParams::default()}
  }
+ /// Planner limits: the controller's $$ while connected, otherwise the Machine Profile.
+ fn motion_config(profile:&MachineProfile,machine:&Machine)->MotionConfig{
+    let base=MotionConfig{max_rate:[profile.max_rate_x,profile.max_rate_y],accel:[profile.accel_x,profile.accel_y],
+      junction_deviation:profile.junction_dev,lookahead:LOOKAHEAD};
+    if machine.connected(){base.with_grbl_settings(machine.info.settings.iter().map(|s|s.as_str()))}else{base}
+ }
+ /// True when the controller's $$ supplies the planner limits.
+ fn motion_from_controller(&self)->bool{self.machine.connected()&&!self.machine.info.settings.is_empty()}
  /// Apply the Machine Profile to the open project, then regenerate the program.
  fn regenerate(&mut self){
     self.project.work_x=self.profile.work_x;self.project.work_y=self.profile.work_y;self.project.travel_feed=self.profile.travel_feed;
     self.max_power=self.profile.max_power;
-    self.plan=gcode::generate(&self.project,self.max_power);
+    self.motion=Self::motion_config(&self.profile,&self.machine);
+    self.plan=gcode::generate(&self.project,self.max_power,&self.motion);
  }
- /// Project JSON without the Machine Profile fields (those belong to the machine, not the project).
+ /// Project JSON without the Machine Profile fields (those belong to the machine, not the project)
+ /// and without name, id and read-only flag (changed only by saving / duplicating).
  fn comparable_json(p:&Project)->String{
-    let mut c=p.clone();c.work_x=0.0;c.work_y=0.0;c.travel_feed=0.0;
+    let mut c=p.clone();c.work_x=0.0;c.work_y=0.0;c.travel_feed=0.0;c.name.clear();c.id.clear();c.read_only=false;
     serde_json::to_string(&c).unwrap_or_default()
+ }
+ // ======================================================================== undo / redo
+ fn reset_history(&mut self){self.undo.clear();self.redo.clear();self.hist=self.project.clone();self.hist_json=Self::comparable_json(&self.project);}
+ /// Called once per frame after the UI: commit an edit to the history, or undo it on a read-only example.
+ fn track_history(&mut self,json:&str){
+    if json==self.hist_json||self.view.busy(){return;}
+    if self.project.read_only{
+      self.project=self.hist.clone();self.selected.retain(|&i|i<self.project.shapes.len());self.regenerate();
+      if matches!(self.dialog,Dialog::None){self.dialog=Dialog::ReadOnly;}
+      return;
+    }
+    let prev=std::mem::replace(&mut self.hist,self.project.clone());
+    self.undo.push(prev);if self.undo.len()>HISTORY{self.undo.remove(0);}
+    self.redo.clear();self.hist_json=json.to_string();
+ }
+ /// Restore a history state, keeping the open project's name, id and read-only flag.
+ fn restore(&mut self,mut p:Project){
+    p.name=self.project.name.clone();p.id=self.project.id.clone();p.read_only=self.project.read_only;
+    self.project=p;self.hist=self.project.clone();self.hist_json=Self::comparable_json(&self.project);
+    self.selected.retain(|&i|i<self.project.shapes.len());self.regenerate();
+ }
+ fn undo(&mut self){
+    if self.view.busy(){return;}
+    let Some(p)=self.undo.pop() else {self.notice="Nothing to undo".into();return;};
+    self.redo.push(self.hist.clone());self.restore(p);self.notice=format!("Undo ({} more)",self.undo.len());
+ }
+ fn redo(&mut self){
+    if self.view.busy(){return;}
+    let Some(p)=self.redo.pop() else {self.notice="Nothing to redo".into();return;};
+    self.undo.push(self.hist.clone());self.restore(p);self.notice=format!("Redo ({} more)",self.redo.len());
+ }
+ /// Requests from the canvas and its tool strip.
+ fn handle(&mut self,ev:Events){
+    if ev.undo{self.undo();}
+    if ev.redo{self.redo();}
+    if ev.changed{self.regenerate();}
+    if let Some(n)=ev.notice{self.notice=n;}
  }
  fn duration_hms(seconds:f32)->String {let t=seconds.max(0.0).ceil() as u64; format!("{:02}:{:02}:{:02}",t/3600,(t/60)%60,t%60)}
  fn action(ui:&mut egui::Ui,label:&str,color:Color32)->egui::Response {
@@ -244,19 +380,26 @@ impl LaserApp {
       Err(e)=>self.notice=format!("Save failed: {e}"),
     }
  }
- /// Save button: first save of a project asks for a name.
+ /// Save button: first save of a project asks for a name. A read-only example is duplicated instead.
  fn request_save(&mut self){
     if !self.project_active {return;}
+    if self.project.read_only {self.request_duplicate();return;}
     if self.saved_once {self.save();} else {self.dialog=Dialog::SaveAs{name:self.project.name.clone(),copy:false,then:None};}
  }
  fn request_save_as(&mut self){
     if !self.project_active {return;}
+    if self.project.read_only {self.request_duplicate();return;}
     let name=if self.saved_once{format!("{} - Copy",self.project.name)}else{self.project.name.clone()};
     self.dialog=Dialog::SaveAs{name,copy:self.saved_once,then:None};
  }
+ /// Duplicate a read-only example into an editable project (asks for the name).
+ fn request_duplicate(&mut self){
+    let base=self.project.name.trim_start_matches("Example - ").trim_start_matches("Calibration - ").to_string();
+    self.dialog=Dialog::SaveAs{name:format!("{base} - Copy"),copy:true,then:None};
+ }
  /// Name confirmed in the Save As dialog (overwrite already confirmed if needed).
  fn finish_save_as(&mut self,name:String,copy:bool,then:Option<Pending>){
-    if copy {self.project.id=geometry::new_id();}
+    if copy {self.project.id=geometry::new_id();self.project.read_only=false;self.reset_history();}
     self.project.name=name;
     self.save();
     if let Some(p)=then {self.perform(p);}
@@ -267,11 +410,17 @@ impl LaserApp {
     match p {
       Pending::New=>{
         self.project=Project::blank();self.project_active=true;self.saved_once=false;
-        self.selected.clear();self.view.request_fit();self.regenerate();self.mark_clean();self.notice="New project".into();
+        self.selected.clear();self.view.request_fit();self.regenerate();self.mark_clean();self.reset_history();self.notice="New project".into();
       }
       Pending::Close=>{
         self.project=Project::blank();self.project_active=false;self.saved_once=false;
-        self.selected.clear();self.regenerate();self.mark_clean();self.notice="Project closed".into();
+        self.selected.clear();self.regenerate();self.mark_clean();self.reset_history();self.notice="Project closed".into();
+      }
+      Pending::Load(p)=>{
+        // Generated project (calibration pattern): open, not saved yet, marked unsaved.
+        self.project=*p;self.project.ensure_uids();self.project_active=true;self.saved_once=false;
+        self.selected.clear();self.view.request_fit_shapes();self.regenerate();self.reset_history();
+        self.saved_json.clear();self.notice=format!("Generated '{}' (not saved yet)",self.project.name);
       }
       Pending::Open(name)=>{
         let Some(s)=&self.store else {self.notice="Database unavailable".into();return;};
@@ -279,9 +428,11 @@ impl LaserApp {
           Ok(Some(mut p))=>{
             // Projects saved before v0.1.4 have no id: assign one now and store it.
             if p.id.is_empty(){p.id=geometry::new_id();let _=s.save(&p);}
+            // Projects saved before v0.2.1: shapes get uids (attachment targets).
+            p.ensure_uids();
             self.project=p;self.project_active=true;self.saved_once=true;
-            self.selected.clear();self.view.request_fit();self.regenerate();self.mark_clean();
-            self.notice=format!("Opened '{name}'");
+            self.selected.clear();self.view.request_fit_shapes();self.regenerate();self.mark_clean();self.reset_history();
+            self.notice=if self.project.read_only{format!("Opened '{name}' (read-only example: Duplicate to edit)")}else{format!("Opened '{name}'")};
           }
           Ok(None)=>self.notice=format!("'{name}' not found"),
           Err(e)=>self.notice=format!("Open failed: {e}"),
@@ -290,6 +441,7 @@ impl LaserApp {
     }
  }
  fn delete_project(&mut self,name:&str){
+    if self.builtin_names.iter().any(|n|n==name){self.notice="Built-in examples cannot be deleted".into();return;}
     let Some(s)=&self.store else {return;};
     match s.delete(name){
       Ok(())=>{
@@ -315,15 +467,22 @@ impl LaserApp {
 
  // ======================================================================== runs
  fn refresh_runs(&mut self){if let Some(s)=&self.store{self.runs=s.runs().unwrap_or_default();}}
- /// Stream `lines` and open a run record for it. `path` (canvas coordinates) drives the live view.
- fn begin_run(&mut self,kind:&str,lines:Vec<String>,path:Vec<Move>){
+ /// Stream `lines` and open a run record for it. The lines are planned into the trajectory that drives the live view.
+ fn begin_run(&mut self,kind:&str,lines:Vec<String>){
     if self.active_run.is_some()||self.machine.running {self.notice="A run is already in progress".into();return;}
     self.job_lines=lines;
     self.machine.start(&self.job_lines);
     if !self.machine.running {return;}
     // Every program starts with M5.
     self.spot_on=false;
-    self.live=Some(LiveView{path,origin:self.project.origin,progress:0,head:None});
+    // Plan from where the head is now (work coordinates; job 0,0 when not reported).
+    let from=self.machine.info.wpos.map_or([0.0,0.0],|w|[w.0,w.1]);
+    let traj=motion_planner::plan(&self.motion,&motion_planner::gcode::blocks_from_lines(&self.job_lines,from));
+    let origin=self.project.origin;
+    let path:Vec<Move>=traj.segments.iter().map(|s|Move{x:origin.0+s.block.end[0],y:origin.1+s.block.end[1],
+      feed:s.block.feed,power:s.block.power,laser:s.block.laser,rapid:s.block.rapid}).collect();
+    let start=(origin.0+traj.start[0],origin.1+traj.start[1]);
+    self.live=Some(LiveView{traj,path,origin,start,clock:0.0,last:Instant::now(),progress:0,head:start,laser:false});
     let record=RunRecord{kind:kind.into(),project_id:self.project.id.clone(),project_name:self.project.name.clone(),
       estimate_s:if kind=="Job"{self.plan.estimated_seconds}else{0.0},
       port:self.machine.port_label(),baud:self.machine.baud,firmware:self.machine.firmware.clone(),simulated:self.machine.simulate,
@@ -387,15 +546,15 @@ impl LaserApp {
     };
     match self.trace_target{
       TraceTarget::Part=>bbox(&mut self.selected.iter().copied()).ok_or_else(||"Select a part on the canvas to trace it".to_string()),
-      TraceTarget::Job=>bbox(&mut (0..self.project.shapes.len())).ok_or_else(||"Nothing to trace: the canvas has no shapes".to_string()),
+      TraceTarget::Job=>bbox(&mut (0..self.project.shapes.len()).filter(|&i|self.project.shapes[i].layer==Layer::Burn)).ok_or_else(||"Nothing to trace: no shapes on the Burn layer".to_string()),
       TraceTarget::Fence=>{
         if !self.project.fence.on{return Err("Turn the work fence on to trace it".into());}
         let (ox,oy)=self.project.origin;Ok((ox,oy,ox+self.project.fence.w,oy+self.project.fence.h))
       }
     }
  }
- /// Trace program (relative to the origin marker) and its path in canvas coordinates.
- fn trace_program(&self)->Result<(Vec<String>,Vec<Move>),String>{
+ /// Trace program, relative to the origin marker.
+ fn trace_program(&self)->Result<Vec<String>,String>{
     let (x0,y0,x1,y1)=self.trace_rect()?;
     let corners=[(x0,y0),(x1,y0),(x1,y1),(x0,y1),(x0,y0)];
     let warnings=gcode::limit_warnings(&self.project,gcode::relative_span(&corners,self.project.origin),"Trace");
@@ -403,13 +562,11 @@ impl LaserApp {
     let (ox,oy)=self.project.origin;
     let c=|v:f32|gcode::coord(v);
     let mut lines=vec!["M5".to_string(),"G21".into(),"G90".into(),format!("G0 X{:.3} Y{:.3}",c(x0-ox),c(y0-oy)),format!("M3 S{}",self.spot_power)];
-    let mut path=vec![Move{x:x0,y:y0,feed:self.project.travel_feed,power:0,laser:false}];
     for (i,(x,y)) in corners.iter().skip(1).enumerate(){
       lines.push(if i==0{format!("G1 X{:.3} Y{:.3} F{:.1}",c(x-ox),c(y-oy),self.frame_feed)}else{format!("G1 X{:.3} Y{:.3}",c(x-ox),c(y-oy))});
-      path.push(Move{x:*x,y:*y,feed:self.frame_feed,power:self.spot_power,laser:true});
     }
     lines.push("M5".into());
-    Ok((lines,path))
+    Ok(lines)
  }
  fn notice_dialog(&mut self,title:&str,msg:String){self.dialog=Dialog::Notice{title:title.into(),msg};}
  fn jog(&mut self,dx:f32,dy:f32){
@@ -457,32 +614,101 @@ impl LaserApp {
     if c.contains("M5"){self.spot_on=false;}
     else if c.contains("M3")||c.contains("M4"){self.spot_on=true;}
  }
- /// Head position and progress along the live run's path.
- fn update_live(&mut self,dt:f32){
+ /// Advance the run clock and place the head on the planned trajectory.
+ /// Real elapsed time (not the capped frame time), scaled by the Simulate speed; held while the
+ /// controller reports Hold, Door or Alarm.
+ fn update_live(&mut self){
     let Some(lv)=&mut self.live else {return;};
-    let Some(w)=self.machine.info.wpos else {return;};
-    let target=(lv.origin.0+w.0,lv.origin.1+w.1);
-    let a=1.0-(-dt*12.0).exp();
-    lv.head=Some(match lv.head{None=>target,Some(h)=>(h.0+(target.0-h.0)*a,h.1+(target.1-h.1)*a)});
-    // Nearest segment within a forward window; earliest one within 0.02 mm of the best (adjacent raster lines).
-    let end=(lv.progress+300).min(lv.path.len());
-    let mut dists=Vec::with_capacity(end.saturating_sub(lv.progress));
-    for i in lv.progress..end{
-      let p0=if i==0{lv.origin}else{(lv.path[i-1].x,lv.path[i-1].y)};
-      dists.push(seg_dist(target,p0,(lv.path[i].x,lv.path[i].y)));
-    }
-    let best=dists.iter().cloned().fold(f32::MAX,f32::min);
-    if best<1.0{if let Some(k)=dists.iter().position(|&d|d<=best+0.02){lv.progress+=k;}}
+    let now=Instant::now();
+    let elapsed=(now-lv.last).as_secs_f32();lv.last=now;
+    let state=&self.machine.state;
+    let held=state.starts_with("Hold")||state.starts_with("Door")||state.starts_with("Alarm");
+    if !held{lv.clock+=elapsed*if self.machine.simulate{self.machine.sim_speed}else{1.0};}
+    let s=lv.traj.sample(lv.clock);
+    lv.head=(lv.origin.0+s.pos[0],lv.origin.1+s.pos[1]);
+    lv.progress=s.segment;
+    lv.laser=s.laser;
  }
 
  // ======================================================================== panels
+ /// Burn-order position (1-based) of shape `i` among the Burn layer shapes, and their count.
+ fn burn_position(&self,i:usize)->(usize,usize){
+    let burn:Vec<usize>=(0..self.project.shapes.len()).filter(|&k|self.project.shapes[k].layer==Layer::Burn).collect();
+    (burn.iter().position(|&k|k==i).map_or(0,|p|p+1),burn.len())
+ }
+ /// Move shape `i` in the burn order (its place among the Burn layer shapes).
+ fn move_order(&mut self,i:usize,to:OrderMove){
+    let burn:Vec<usize>=(0..self.project.shapes.len()).filter(|&k|self.project.shapes[k].layer==Layer::Burn).collect();
+    let Some(pos)=burn.iter().position(|&k|k==i) else {return;};
+    let target=match to{OrderMove::First=>0,OrderMove::Earlier=>pos.saturating_sub(1),OrderMove::Later=>(pos+1).min(burn.len()-1),OrderMove::Last=>burn.len()-1};
+    if target==pos{return;}
+    let t=burn[target];
+    let s=self.project.shapes.remove(i);
+    let t_adj=if t>i{t-1}else{t};
+    let at=if target>pos{t_adj+1}else{t_adj};
+    self.project.shapes.insert(at,s);
+    self.selected=vec![at];
+    self.regenerate();
+ }
+ /// Replace burn text by plain geometry: polylines (single-stroke) or a merged-outline region (outline font).
+ fn convert_text(&mut self,i:usize){
+    let Some(t)=self.project.shapes.get(i).cloned() else {return;};
+    let mut parts:Vec<Shape>=vec![];
+    let copy=|mut g:Shape|{g.layer=t.layer;g.feed=t.feed;g.power=t.power;g.passes=t.passes;g.lines_per_mm=t.lines_per_mm;g.fill=t.fill;
+      g.operation=t.operation;g.stroke_lpm=t.stroke_lpm;g.overscan=t.overscan;g.unidirectional=t.unidirectional;g.border_w=t.border_w;g};
+    match t.font{
+      TextFont::Stroke=>{for pts in crate::font::stroke_text(&t.text,t.x,t.y,t.h){let mut g=copy(Shape::polyline(pts,false));g.operation=Operation::Outline;parts.push(g);}}
+      TextFont::Outline=>{if let Some(r)=paths::region(&t){parts.push(copy(Shape::region(paths::to_polys(&r))));}}
+    }
+    if parts.is_empty(){self.notice="Nothing to convert".into();return;}
+    let n=parts.len();
+    self.project.shapes.remove(i);
+    for (k,g) in parts.into_iter().enumerate(){self.project.shapes.insert(i+k,g);}
+    self.selected=(i..i+n).collect();
+    self.notice=format!("Text converted to {n} shape(s)");
+    self.regenerate();
+ }
  fn shape_properties(&mut self, ui:&mut egui::Ui){
-     if self.selected.len()>1 {ui.weak(format!("{} shapes selected. Select one shape to edit.",self.selected.len()));return;}
+     let amber=Color32::from_rgb(235,190,70);
+     if self.project.read_only&&self.project_active{
+       ui.horizontal_wrapped(|ui|{
+         ui.colored_label(amber,"Read-only example");
+         if ui.button("Duplicate to edit").on_hover_text("Save an editable copy under a new name").clicked(){self.request_duplicate();}
+       });
+     }
+     if self.selected.len()>1 {
+       ui.weak(format!("{} shapes selected.",self.selected.len()));
+       ui.weak("Merge (tool strip) joins closed shapes that share an edge or overlap into one outline. Select one shape to edit it.");
+       return;
+     }
+     let Some(&i)=self.selected.first() else {ui.weak("Select a shape on the canvas.");return;};
+     if i>=self.project.shapes.len(){return;}
      let step=self.view.grid_spacing;
      let max_power=self.max_power;
-     if let Some(&i)=self.selected.first() {if let Some(s)=self.project.shapes.get_mut(i){
-       let mut changed=false;
-       ui.strong(format!("{:?} #{}",s.kind,i+1));
+     let (order_pos,order_n)=self.burn_position(i);
+     let before=self.project.shapes[i].extent();
+     let mut changed=false;
+     let mut leader_req=false;
+     let mut convert=false;
+     let mut order_move:Option<OrderMove>=None;
+     let text_id=egui::Id::new(("text_edit",i));
+     {
+       let s=&mut self.project.shapes[i];
+       let kind=match s.kind{
+         ShapeKind::Rectangle=>"Rectangle".to_string(),ShapeKind::Circle=>"Circle".to_string(),
+         ShapeKind::Line=>if s.width>0.0{"Line trace".into()}else{"Line".into()},
+         ShapeKind::Polyline=>if s.closed{"Closed polyline".into()}else if s.width>0.0{"Polyline trace".into()}else{"Polyline".into()},
+         ShapeKind::Region=>"Merged outline".to_string(),ShapeKind::Text=>"Text".to_string(),
+       };
+       ui.horizontal(|ui|{
+         ui.strong(format!("{kind} #{}",i+1));
+         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
+           egui::ComboBox::from_id_salt("p_layer").width(76.0).selected_text(s.layer.name()).show_ui(ui,|ui|{
+             for l in Layer::ALL{changed|=ui.selectable_value(&mut s.layer,l,l.name()).changed();}
+           }).response.on_hover_text("Layer: Burn generates G-code; Notes and Guides are shown only");
+         });
+       });
+       // ---------------- geometry
        egui::Grid::new("geom-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
          match s.kind {
            ShapeKind::Rectangle=>{
@@ -505,29 +731,192 @@ impl LaserApp {
            ShapeKind::Circle=>{
              let (x0,y0,x1,y1)=s.extent();
              let (mut cx,mut cy,mut d)=((x0+x1)/2.0,(y0+y1)/2.0,x1-x0);
-             ui.label("Centre X");changed|=widgets::num_f32(ui,"p_cx",&mut cx,step,-3000.0,3000.0,3,"mm");ui.end_row();
-             ui.label("Centre Y");changed|=widgets::num_f32(ui,"p_cy",&mut cy,step,-3000.0,3000.0,3,"mm");ui.end_row();
-             ui.label("Diameter");changed|=widgets::num_f32(ui,"p_d",&mut d,step,0.001,3000.0,3,"mm");ui.end_row();
-             if changed {s.x=cx-d/2.0;s.y=cy-d/2.0;s.w=d;s.h=d;}
+             let mut c=false;
+             ui.label("Centre X");c|=widgets::num_f32(ui,"p_cx",&mut cx,step,-3000.0,3000.0,3,"mm");ui.end_row();
+             ui.label("Centre Y");c|=widgets::num_f32(ui,"p_cy",&mut cy,step,-3000.0,3000.0,3,"mm");ui.end_row();
+             ui.label("Diameter");c|=widgets::num_f32(ui,"p_d",&mut d,step,0.001,3000.0,3,"mm");ui.end_row();
+             if c {s.x=cx-d/2.0;s.y=cy-d/2.0;s.w=d;s.h=d;changed=true;}
+           }
+           ShapeKind::Polyline|ShapeKind::Region=>{
+             let (x0,y0,x1,y1)=s.extent();
+             let (mut nx,mut ny)=(x0,y0);
+             ui.label("X");let mx=widgets::num_f32(ui,"p_px",&mut nx,step,-3000.0,3000.0,3,"mm");ui.end_row();
+             ui.label("Y");let my=widgets::num_f32(ui,"p_py",&mut ny,step,-3000.0,3000.0,3,"mm");ui.end_row();
+             if mx||my{s.translate(nx-x0,ny-y0);changed=true;}
+             ui.label("Size");ui.weak(format!("{:.3} × {:.3} mm",x1-x0,y1-y0));ui.end_row();
+             if s.kind==ShapeKind::Polyline{
+               ui.label("Vertices");ui.weak(format!("{} (drag the handles to move them)",s.points.len()));ui.end_row();
+               ui.label("Closed");
+               let mut cl=s.closed;
+               if ui.add_enabled(s.points.len()>=3,egui::Checkbox::new(&mut cl,"closed loop")).on_hover_text("Closed: an outline with border and interior. Open: a trace.").changed(){
+                 s.closed=cl;s.operation=if cl{Operation::Fill}else{Operation::Outline};changed=true;
+               }
+               ui.end_row();
+               let n=s.points.len();
+               let l:f32=(0..if s.closed{n}else{n.saturating_sub(1)}).map(|k|{let (a,b)=(s.points[k],s.points[(k+1)%n]);((b.0-a.0).powi(2)+(b.1-a.1).powi(2)).sqrt()}).sum();
+               ui.label("Length");ui.weak(format!("{l:.3} mm"));ui.end_row();
+             }else{
+               let holes:usize=s.polys.iter().map(|p|p.holes.len()).sum();
+               ui.label("Outline");ui.weak(format!("{} polygon(s), {} hole(s)",s.polys.len(),holes));ui.end_row();
+             }
+           }
+           ShapeKind::Text=>{
+             ui.label("Text");
+             let mut t=ui.data_mut(|d|d.get_temp::<String>(text_id)).unwrap_or_else(||s.text.clone());
+             let r=ui.add(egui::TextEdit::singleline(&mut t).desired_width(170.0));
+             if r.has_focus(){ui.data_mut(|d|d.insert_temp(text_id,t.clone()));}
+             if r.lost_focus(){if t!=s.text{s.text=t;changed=true;}ui.data_mut(|d|d.remove::<String>(text_id));}
+             ui.end_row();
+             ui.label("Height");changed|=widgets::num_f32(ui,"p_th",&mut s.h,0.5,0.5,200.0,2,"mm");ui.end_row();
+             ui.label("X");changed|=widgets::num_f32(ui,"p_tx",&mut s.x,step,-3000.0,3000.0,3,"mm");ui.end_row();
+             ui.label("Y");changed|=widgets::num_f32(ui,"p_ty",&mut s.y,step,-3000.0,3000.0,3,"mm");ui.end_row();
+             if s.layer==Layer::Burn{
+               ui.label("Font");
+               ui.horizontal(|ui|{
+                 changed|=ui.radio_value(&mut s.font,TextFont::Stroke,"Single-stroke").on_hover_text("Centerlines, one pass: small IDs").changed();
+                 changed|=ui.radio_value(&mut s.font,TextFont::Outline,"Outline").on_hover_text("Closed glyphs with fill and border: larger text").changed();
+               });
+               ui.end_row();
+             }
+             ui.label("Size");ui.weak(format!("{:.2} × {:.2} mm",s.text_width(),s.h));ui.end_row();
            }
          }
        });
-       ui.separator();ui.strong("Operation");
-       if s.kind==ShapeKind::Line {ui.weak("Line stroke");}else {
-         ui.horizontal_wrapped(|ui|{changed|=ui.radio_value(&mut s.operation,Operation::Outline,"Outline").changed();changed|=ui.radio_value(&mut s.operation,Operation::Fill,"Fill").changed();changed|=ui.radio_value(&mut s.operation,Operation::Both,"Both").changed();});
-         ui.label("Fill type");ui.horizontal_wrapped(|ui|{changed|=ui.radio_value(&mut s.fill,Fill::Horizontal,"Horizontal").changed();changed|=ui.radio_value(&mut s.fill,Fill::Vertical,"Vertical").changed();changed|=ui.radio_value(&mut s.fill,Fill::Crosshatch,"Crosshatch").changed();});
+       // ---------------- text: leader, attachment, conversion
+       if s.kind==ShapeKind::Text{
+         ui.horizontal_wrapped(|ui|{
+           if ui.button(if s.leader.is_some(){"Move leader"}else{"Add leader"}).on_hover_text("Then click the point it points to; a shape under the click attaches this note to it").clicked(){leader_req=true;}
+           if s.leader.is_some()&&ui.button("Remove leader").clicked(){s.leader=None;changed=true;}
+           if s.attach.is_some()&&ui.button("Detach").on_hover_text("Stop moving with the attached shape").clicked(){s.attach=None;changed=true;}
+           if s.layer==Layer::Burn&&ui.button("Convert to geometry").on_hover_text("Replace the text by polylines (single-stroke) or a merged outline (outline font)").clicked(){convert=true;}
+         });
+         if s.attach.is_some(){ui.weak("Attached: moves with its shape.");}
        }
-       egui::Grid::new("process-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
-         if s.kind!=ShapeKind::Line {
-           ui.label("Lines/mm");changed|=widgets::num_f32(ui,"p_lpm",&mut s.lines_per_mm,1.0,0.1,100.0,1,"");ui.end_row();
-           ui.label("Spacing");ui.weak(format!("{:.4} mm",1.0/s.lines_per_mm.max(0.1)));ui.end_row();
+       if s.layer!=Layer::Burn{
+         ui.weak(format!("{} layer: shown on the canvas, never burned.",s.layer.name()));
+       }else{
+         let stroke_text=s.kind==ShapeKind::Text&&s.font==TextFont::Stroke;
+         // ---------------- trace
+         if s.is_trace(){
+           ui.separator();ui.strong("Trace");
+           egui::Grid::new("trace-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+             ui.label("Width");changed|=widgets::num_f32(ui,"p_tw",&mut s.width,0.1,0.0,100.0,2,"mm");ui.end_row();
+             if s.width>0.0{
+               ui.label("Direction");ui.horizontal(|ui|{
+                 changed|=ui.radio_value(&mut s.stroke_dir,StrokeDir::Along,"Along").on_hover_text("Parallel passes along the path, open ends").changed();
+                 changed|=ui.radio_value(&mut s.stroke_dir,StrokeDir::Across,"Across").on_hover_text("Rails across the path").changed();});ui.end_row();
+               ui.label("Density");changed|=widgets::num_f32(ui,"p_tlpm",&mut s.stroke_lpm,1.0,0.1,100.0,1,"lines/mm");ui.end_row();
+               ui.label(if s.stroke_dir==StrokeDir::Along{"Lines"}else{"Rails"});
+               if s.stroke_dir==StrokeDir::Along{ui.weak(format!("{} ({:.2} mm × {:.1} lines/mm)",paths::line_count(s.width,s.stroke_lpm),s.width,s.stroke_lpm));}
+               else{ui.weak(format!("every {:.3} mm along the path",1.0/s.stroke_lpm.max(0.1)));}
+               ui.end_row();
+               ui.label("End cap");ui.horizontal(|ui|{
+                 changed|=ui.radio_value(&mut s.cap,Cap::Square,"Square").on_hover_text("Flush with the end points").changed();
+                 changed|=ui.radio_value(&mut s.cap,Cap::Round,"Round").on_hover_text("Half circle centred on each end point (adds width/2)").changed();});ui.end_row();
+               if s.kind==ShapeKind::Polyline{
+                 ui.label("Corners");ui.horizontal(|ui|{
+                   changed|=ui.radio_value(&mut s.join,Join::Miter,"Miter").changed();
+                   changed|=ui.radio_value(&mut s.join,Join::Round,"Round").changed();});ui.end_row();
+               }
+             }else{ui.label("");ui.weak("Width 0: one pass on the centerline");ui.end_row();}
+           });
          }
-         ui.label("Feed");changed|=widgets::num_f32(ui,"p_feed",&mut s.feed,50.0,1.0,30000.0,0,"mm/min");ui.end_row();
-         ui.label("Power");changed|=widgets::num_u32(ui,"p_pow",&mut s.power,10,0,max_power,&format!("/ {max_power}"));ui.end_row();
-         ui.label("Passes");changed|=widgets::num_u32(ui,"p_pass",&mut s.passes,1,1,100,"");ui.end_row();
-       });
-       if changed {self.regenerate();}
-     }}else{ui.weak("Select a shape on the canvas.");}
+         // ---------------- border + interior
+         if s.is_closed(){
+           ui.separator();ui.strong("Border");
+           egui::Grid::new("border-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+             ui.label("Width");changed|=widgets::num_f32(ui,"p_bw",&mut s.border_w,0.1,0.0,100.0,2,"mm");ui.end_row();
+             if s.border_w>0.0{
+               ui.label("Alignment");ui.horizontal(|ui|{
+                 changed|=ui.radio_value(&mut s.border_align,Align::Inside,"Inside").changed();
+                 changed|=ui.radio_value(&mut s.border_align,Align::Centered,"Centred").changed();
+                 changed|=ui.radio_value(&mut s.border_align,Align::Outside,"Outside").changed();});ui.end_row();
+               ui.label("Direction");ui.horizontal(|ui|{
+                 changed|=ui.radio_value(&mut s.stroke_dir,StrokeDir::Along,"Along").on_hover_text("Closed contour passes").changed();
+                 changed|=ui.radio_value(&mut s.stroke_dir,StrokeDir::Across,"Across").on_hover_text("Rails across the band").changed();});ui.end_row();
+               ui.label("Density");changed|=widgets::num_f32(ui,"p_blpm",&mut s.stroke_lpm,1.0,0.1,100.0,1,"lines/mm");ui.end_row();
+               if s.stroke_dir==StrokeDir::Along{ui.label("Lines");ui.weak(format!("{} ({:.2} mm × {:.1} lines/mm)",paths::line_count(s.border_w,s.stroke_lpm),s.border_w,s.stroke_lpm));ui.end_row();}
+               ui.label("Corners");ui.horizontal(|ui|{
+                 changed|=ui.radio_value(&mut s.join,Join::Miter,"Miter").changed();
+                 changed|=ui.radio_value(&mut s.join,Join::Round,"Round").changed();});ui.end_row();
+             }else{ui.label("");ui.weak("Width 0: no border");ui.end_row();}
+           });
+           ui.separator();ui.strong("Interior");
+           egui::Grid::new("interior-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+             let mut outline=matches!(s.operation,Operation::Outline|Operation::Both);
+             let mut filled=matches!(s.operation,Operation::Fill|Operation::Both);
+             ui.label("Outline pass");
+             if ui.checkbox(&mut outline,"one pass on the drawn edge").changed(){changed=true;}
+             ui.end_row();
+             ui.label("Fill");
+             let name=|f:Fill|match f{Fill::Horizontal=>"Horizontal",Fill::Vertical=>"Vertical",Fill::Crosshatch=>"Crosshatch",Fill::Concentric=>"Concentric"};
+             egui::ComboBox::from_id_salt("p_fill").width(110.0).selected_text(if filled{name(s.fill)}else{"None"}).show_ui(ui,|ui|{
+               if ui.selectable_label(!filled,"None").clicked(){filled=false;changed=true;}
+               for f in [Fill::Horizontal,Fill::Vertical,Fill::Crosshatch,Fill::Concentric]{
+                 if ui.selectable_label(filled&&s.fill==f,name(f)).clicked(){filled=true;s.fill=f;changed=true;}
+               }
+             });
+             ui.end_row();
+             s.operation=match (outline,filled){(true,true)=>Operation::Both,(true,false)=>Operation::Outline,(false,true)=>Operation::Fill,(false,false)=>Operation::None};
+             if filled{
+               ui.label("Density");changed|=widgets::num_f32(ui,"p_lpm",&mut s.lines_per_mm,1.0,0.1,100.0,1,"lines/mm");ui.end_row();
+               ui.label("Spacing");ui.weak(format!("{:.4} mm",1.0/s.lines_per_mm.max(0.1)));ui.end_row();
+               if s.border_w>0.0{
+                 ui.label("Relation");ui.horizontal(|ui|{
+                   changed|=ui.radio_value(&mut s.relation,Relation::Abut,"Abut").on_hover_text("Interior starts at the border's inner edge").changed();
+                   changed|=ui.radio_value(&mut s.relation,Relation::Overlap,"Overlap").on_hover_text("Interior extends into the border").changed();
+                   changed|=ui.radio_value(&mut s.relation,Relation::Gap,"Gap").on_hover_text("Unburned ring between border and interior").changed();});ui.end_row();
+                 if s.relation!=Relation::Abut{ui.label(if s.relation==Relation::Overlap{"Overlap"}else{"Gap"});changed|=widgets::num_f32(ui,"p_rel",&mut s.relation_mm,0.1,0.0,100.0,2,"mm");ui.end_row();}
+               }
+             }
+           });
+         }
+         // ---------------- raster
+         if !stroke_text{
+           ui.separator();ui.strong("Raster");
+           egui::Grid::new("raster-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+             ui.label("Scan");ui.horizontal(|ui|{
+               let mut uni=s.unidirectional;
+               changed|=ui.radio_value(&mut uni,false,"Bidirectional").changed();
+               changed|=ui.radio_value(&mut uni,true,"Unidirectional").on_hover_text("Every pass in the same direction (travel back between passes)").changed();
+               s.unidirectional=uni;});ui.end_row();
+             ui.label("Overscan");changed|=widgets::num_f32(ui,"p_ovs",&mut s.overscan,0.5,0.0,50.0,2,"mm");ui.end_row();
+           });
+           if s.overscan>0.0{ui.small("Laser-off lead-in / lead-out at the burn feed on every open pass. GRBL 0.9 stops at each M3/M5 (planner model), so the pass ends may still burn heavier; see README.");}
+         }
+       }
+       // ---------------- process
+       if s.layer==Layer::Burn{
+         ui.separator();ui.strong("Process");
+         egui::Grid::new("process-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+           ui.label("Feed");changed|=widgets::num_f32(ui,"p_feed",&mut s.feed,50.0,1.0,30000.0,0,"mm/min");ui.end_row();
+           ui.label("Power");changed|=widgets::num_u32(ui,"p_pow",&mut s.power,10,0,max_power,&format!("/ {max_power}"));ui.end_row();
+           ui.label("Passes");changed|=widgets::num_u32(ui,"p_pass",&mut s.passes,1,1,100,"");ui.end_row();
+         });
+         ui.separator();
+         ui.horizontal_wrapped(|ui|{
+           ui.strong("Burn order");ui.label(format!("{order_pos} of {order_n}"));
+           if ui.small_button("First").clicked(){order_move=Some(OrderMove::First);}
+           if ui.small_button("Earlier").clicked(){order_move=Some(OrderMove::Earlier);}
+           if ui.small_button("Later").clicked(){order_move=Some(OrderMove::Later);}
+           if ui.small_button("Last").clicked(){order_move=Some(OrderMove::Last);}
+         });
+       }
+       if s.kind==ShapeKind::Polyline{s.sync_box();}
+     }
+     if changed {
+       // Notes attached to this shape follow a pure move (same size, new position).
+       let after=self.project.shapes[i].extent();
+       let (dx,dy)=(after.0-before.0,after.1-before.1);
+       let same=((after.2-after.0)-(before.2-before.0)).abs()<1e-4&&((after.3-after.1)-(before.3-before.1)).abs()<1e-4;
+       if same&&(dx.abs()>1e-6||dy.abs()>1e-6)&&self.project.shapes[i].kind!=ShapeKind::Text{
+         for f in canvas::followers(&self.project,&[i]){self.project.shapes[f].translate(dx,dy);}
+       }
+       self.regenerate();
+     }
+     if leader_req{self.view.begin_leader(i);self.notice="Click the point the leader points to".into();}
+     if convert{self.convert_text(i);}
+     if let Some(m)=order_move{self.move_order(i,m);}
  }
  fn panel_header(&mut self,ui:&mut egui::Ui,id:usize) {
    // Docked header: title on the left, Float on the right. Collapse arrow is drawn by CollapsingState.
@@ -541,52 +930,67 @@ impl LaserApp {
    egui::ComboBox::from_id_salt("saved_project_choice")
      .selected_text(if self.project_to_load.is_empty(){"Saved projects…"}else{&self.project_to_load})
      .width(ui.available_width()).show_ui(ui,|ui|{
-       for name in &self.saved_names {ui.selectable_value(&mut self.project_to_load,name.clone(),name);}
+       for name in &self.saved_names {
+         let label=if self.builtin_names.contains(name){format!("{name}  · read-only")}else{name.clone()};
+         ui.selectable_value(&mut self.project_to_load,name.clone(),label);
+       }
      });
    let has_pick=!self.project_to_load.is_empty();
+   let pick_builtin=self.builtin_names.contains(&self.project_to_load);
    ui.horizontal(|ui|{
      if ui.add_enabled(has_pick,egui::Button::new("Open").min_size(Vec2::new(80.0,26.0))).on_hover_text("Open the selected project").clicked(){
-       let name=self.project_to_load.clone();self.request(Pending::Open(name));
+       // The dropdown is a browser only: cleared once the project is opened.
+       let name=std::mem::take(&mut self.project_to_load);self.request(Pending::Open(name));
      }
-     if ui.add_enabled(has_pick,egui::Button::new("Delete").min_size(Vec2::new(80.0,26.0))).on_hover_text("Delete the selected project (asks first)").clicked(){
+     if ui.add_enabled(has_pick&&!pick_builtin,egui::Button::new("Delete").min_size(Vec2::new(80.0,26.0))).on_hover_text("Delete the selected project (asks first)").on_disabled_hover_text("Built-in examples cannot be deleted").clicked(){
        self.dialog=Dialog::ConfirmDelete{name:self.project_to_load.clone()};
      }
    });
-   ui.separator();
-   // ---- active project: New / Save / Save As / Close / Export act on the open project ----
-   ui.strong("Active Project");
+ }
+ /// Active Project panel: the open project, its actions, Job Details and Run History.
+ fn active_panel(&mut self,ui:&mut egui::Ui){
    if self.project_active {
      ui.horizontal(|ui|{
        ui.label(&self.project.name);
        if self.dirty {ui.colored_label(Color32::from_rgb(235,190,70),"*").on_hover_text("Unsaved changes");}
        if !self.saved_once {ui.weak("(not saved yet)");}
+       if self.project.read_only {ui.colored_label(Color32::from_rgb(235,190,70),"read-only");}
      });
    } else {ui.weak("No project open.");}
    let active=self.project_active;
+   let ro=self.project.read_only;
    ui.horizontal_wrapped(|ui|{
      if ui.button("New").clicked(){self.request(Pending::New);}
-     if ui.add_enabled(active,egui::Button::new("Save")).clicked(){self.request_save();}
-     if ui.add_enabled(active,egui::Button::new("Save As")).clicked(){self.request_save_as();}
+     if ro {
+       if ui.add_enabled(active,egui::Button::new("Duplicate")).on_hover_text("Save an editable copy of this example").clicked(){self.request_duplicate();}
+     } else {
+       if ui.add_enabled(active,egui::Button::new("Save")).clicked(){self.request_save();}
+       if ui.add_enabled(active,egui::Button::new("Save As")).clicked(){self.request_save_as();}
+     }
      if ui.add_enabled(active,egui::Button::new("Close")).clicked(){self.request(Pending::Close);}
      if ui.add_enabled(active&&!self.plan.moves.is_empty(),egui::Button::new("Export G-code")).on_hover_text("Write the program to ~/LaserCNC/exports").clicked(){self.export_gcode();}
    });
    if !self.project_active {return;}
    // ---- job details ----
    ui.separator();ui.strong("Job Details");
-   ui.label(format!("Estimated: {}",Self::duration_hms(self.plan.estimated_seconds)));
-   ui.small("Constant-speed lower bound");
-   ui.label(format!("Shapes: {}",self.project.shapes.len()));
-   if let Some(shape)=self.project.shapes.first(){
-      let (x0,y0,x1,y1)=shape.extent();
-      ui.label(format!("Part: {:.1} × {:.1} mm",x1-x0,y1-y0));
-      ui.label(format!("Fill: {:?} | {:?}",shape.operation,shape.fill));
-      ui.label(format!("Density: {:.1} lines/mm",shape.lines_per_mm));
-      ui.label(format!("Pitch: {:.3} mm",1.0/shape.lines_per_mm.max(0.1)));
-      ui.label(format!("Speed: {:.0} mm/min",shape.feed));
-      ui.label(format!("Power: S{} | Passes: {}",shape.power,shape.passes));
+   // Whole seconds per part, so the shown parts add up exactly to the shown total.
+   let (eng_s,trav_s)=(self.plan.engrave_seconds.round(),self.plan.travel_seconds.round());
+   ui.label(format!("Estimated: {}",Self::duration_hms(eng_s+trav_s))).on_hover_text("Engraving time + Travel time");
+   ui.small(if self.motion_from_controller(){"Planned: acceleration, corners, M3/M5 stops (controller $$)"}else{"Planned: acceleration, corners, M3/M5 stops (Machine Profile)"});
+   let count=|l:Layer|self.project.shapes.iter().filter(|s|s.layer==l).count();
+   ui.label(format!("Shapes: burn {} · notes {} · guides {}",count(Layer::Burn),count(Layer::Notes),count(Layer::Guides)));
+   let burn:Vec<&Shape>=self.project.shapes.iter().filter(|s|s.layer==Layer::Burn).collect();
+   if !burn.is_empty(){
+      let (mut x0,mut y0,mut x1,mut y1)=(f32::MAX,f32::MAX,f32::MIN,f32::MIN);
+      for s in &burn{let e=s.extent();x0=x0.min(e.0);y0=y0.min(e.1);x1=x1.max(e.2);y1=y1.max(e.3);}
+      ui.label(format!("Burn extent: {:.1} × {:.1} mm",x1-x0,y1-y0));
+      let shape=burn[0];
+      ui.label(format!("First shape: S{} · F{:.0} · {} pass(es)",shape.power,shape.feed,shape.passes));
+      if shape.is_closed(){ui.label(format!("Fill: {:?} | {:?} · {:.1} lines/mm",shape.operation,shape.fill,shape.lines_per_mm));}
+      if shape.is_trace(){ui.label(format!("Trace: {:.2} mm {:?} · {:.1} lines/mm",shape.width,shape.stroke_dir,shape.stroke_lpm));}
    }
-   ui.label(format!("Engraving: {:.1} mm",self.plan.engraving_mm));
-   ui.label(format!("Travel: {:.1} mm",self.plan.travel_mm));
+   ui.label(format!("Engraving: {:.1} mm · {}",self.plan.engraving_mm,Self::duration_hms(eng_s))).on_hover_text("Laser on: distance and planned time");
+   ui.label(format!("Travel: {:.1} mm · {}",self.plan.travel_mm,Self::duration_hms(trav_s))).on_hover_text("Laser off (G0 travel and overscan leads): distance and planned time, including the stops at M3/M5");
    ui.label(format!("G-code: {} lines",self.plan.lines.len()));
    // ---- run history for this project ----
    ui.separator();ui.strong("Run History");
@@ -726,6 +1130,7 @@ impl LaserApp {
        self.connection_info(ui);
      },
      1=>{self.projects_panel(ui);},
+     ACTIVE=>{self.active_panel(ui);},
      2=>{self.shape_properties(ui);},
      3=>{
        let mut changed=false;
@@ -736,6 +1141,19 @@ impl LaserApp {
          ui.label("Max PWM S");changed|=widgets::num_u32(ui,"mp_pwm",&mut self.profile.max_power,100,1,100000,"");ui.end_row();
        });
        ui.weak("Saved with the app settings; applies to every project.");
+       ui.separator();
+       ui.strong("Motion");
+       if self.motion_from_controller(){ui.colored_label(Color32::from_rgb(110,210,130),"In use: controller $$ (values below apply when disconnected)");}
+       else{ui.weak("In use: these values (controller $$ is used while connected)");}
+       egui::Grid::new("machine-motion-grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+         ui.label("Max rate X ($110)");changed|=widgets::num_f32(ui,"mp_rx",&mut self.profile.max_rate_x,100.0,1.0,100000.0,0,"mm/min");ui.end_row();
+         ui.label("Max rate Y ($111)");changed|=widgets::num_f32(ui,"mp_ry",&mut self.profile.max_rate_y,100.0,1.0,100000.0,0,"mm/min");ui.end_row();
+         ui.label("Accel X ($120)");changed|=widgets::num_f32(ui,"mp_ax",&mut self.profile.accel_x,10.0,0.1,100000.0,1,"mm/s²");ui.end_row();
+         ui.label("Accel Y ($121)");changed|=widgets::num_f32(ui,"mp_ay",&mut self.profile.accel_y,10.0,0.1,100000.0,1,"mm/s²");ui.end_row();
+         ui.label("Junction dev ($11)");changed|=widgets::num_f32(ui,"mp_jd",&mut self.profile.junction_dev,0.001,0.001,10.0,3,"mm");ui.end_row();
+       });
+       let m=self.motion;
+       ui.weak(format!("Planner: {:.0} / {:.0} mm/min · {:.1} / {:.1} mm/s² · {:.3} mm · {} blocks",m.max_rate[0],m.max_rate[1],m.accel[0],m.accel[1],m.junction_deviation,m.lookahead));
        if changed {self.regenerate();}
      },
      4=>{
@@ -785,7 +1203,7 @@ impl LaserApp {
  fn panel_ui(&mut self,ui:&mut egui::Ui,id:usize){
    // Collapse state is stored in egui memory and persisted between launches.
    // First launch default: only Serial Communications (id 0) is expanded.
-   let state=CollapsingState::load_with_default_open(ui.ctx(),egui::Id::new(("panel",TITLES[id])),id==0);
+   let state=CollapsingState::load_with_default_open(ui.ctx(),egui::Id::new(("panel",TITLES[id])),id==0||id==ACTIVE);
    let _=state.show_header(ui,|ui|self.panel_header(ui,id)).body_unindented(|ui|{ui.add_space(2.0);self.panel_content(ui,id);ui.add_space(4.0);});
  }
  fn panels_layout(&mut self,ctx:&egui::Context){
@@ -809,9 +1227,10 @@ impl LaserApp {
        let mut win=egui::Window::new(TITLES[id]).id(egui::Id::new(("floating_panel",TITLES[id])));
        // G-code / Stream floats over the canvas: background 80 % transparent, no shadow.
        if id==5{win=win.frame(egui::Frame::window(&ctx.style()).fill(Color32::from_rgba_unmultiplied(22,23,26,51)).shadow(egui::Shadow::NONE));}
-       win.resizable(true).collapsible(true).min_width(240.0).min_height(160.0)
-         .default_size(match id{5=>Vec2::new(380.0,620.0),PROPS=>Vec2::new(300.0,520.0),_=>Vec2::new(320.0,360.0)})
-         .default_pos(if id==PROPS{egui::Pos2::new(330.0,190.0)}else{egui::Pos2::new(340.0+id as f32*24.0,150.0+id as f32*24.0)})
+       let (min_w,min_h)=if id==TOOLS{(60.0,60.0)}else{(240.0,160.0)};
+       win.resizable(true).collapsible(true).min_width(min_w).min_height(min_h)
+         .default_size(match id{5=>Vec2::new(380.0,620.0),PROPS=>Vec2::new(300.0,520.0),TOOLS=>Vec2::new(560.0,130.0),_=>Vec2::new(320.0,360.0)})
+         .default_pos(if id==PROPS{egui::Pos2::new(330.0,190.0)}else if id==TOOLS{egui::Pos2::new(330.0,140.0)}else{egui::Pos2::new(340.0+id as f32*24.0,150.0+id as f32*24.0)})
          .show(ctx,|ui|{
            ui.horizontal(|ui|{
              ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
@@ -822,6 +1241,7 @@ impl LaserApp {
            ui.separator();
            // Content fills the window so a corner drag sets the size directly (no snap-back).
            if id==5 {self.monitor_contents(ui,true);}
+           else if id==TOOLS {self.canvas_tools(ui,false);}
            else {egui::ScrollArea::vertical().id_salt(("floating_scroll",id)).auto_shrink([false,false]).show(ui,|ui|self.panel_content(ui,id));}
          });
      }
@@ -835,14 +1255,25 @@ impl LaserApp {
      ui.menu_button("File",|ui|{
        let active=self.project_active;
        if ui.button("New").clicked(){self.request(Pending::New);ui.close_menu();}
+       if ui.button("New calibration pattern…").on_hover_text("Power × feed, line density, fill direction or overscan test pattern").clicked(){
+         self.dialog=Dialog::Calibration{params:self.cal_params.clone(),error:String::new()};ui.close_menu();
+       }
        if ui.button("Open…").on_hover_text("Choose a project in the Projects panel").clicked(){self.panels[1].floating=false;self.show_panel(ui.ctx(),1);ui.close_menu();}
        ui.separator();
-       if ui.add_enabled(active,egui::Button::new("Save")).clicked(){self.request_save();ui.close_menu();}
-       if ui.add_enabled(active,egui::Button::new("Save As…")).clicked(){self.request_save_as();ui.close_menu();}
+       if self.project.read_only{
+         if ui.add_enabled(active,egui::Button::new("Duplicate…")).on_hover_text("Save an editable copy of this example").clicked(){self.request_duplicate();ui.close_menu();}
+       }else{
+         if ui.add_enabled(active,egui::Button::new("Save")).clicked(){self.request_save();ui.close_menu();}
+         if ui.add_enabled(active,egui::Button::new("Save As…")).clicked(){self.request_save_as();ui.close_menu();}
+       }
        if ui.add_enabled(active,egui::Button::new("Close")).clicked(){self.request(Pending::Close);ui.close_menu();}
        ui.separator();
        if ui.button("Delete…").on_hover_text("Choose a project in the Projects panel").clicked(){self.panels[1].floating=false;self.show_panel(ui.ctx(),1);ui.close_menu();}
        if ui.add_enabled(active&&!self.plan.moves.is_empty(),egui::Button::new("Export G-code")).clicked(){self.export_gcode();ui.close_menu();}
+     });
+     ui.menu_button("Edit",|ui|{
+       if ui.add_enabled(!self.undo.is_empty(),egui::Button::new(format!("Undo  ({})",self.undo.len()))).on_hover_text("Ctrl+Z").clicked(){self.undo();ui.close_menu();}
+       if ui.add_enabled(!self.redo.is_empty(),egui::Button::new(format!("Redo  ({})",self.redo.len()))).on_hover_text("Ctrl+Y / Ctrl+Shift+Z").clicked(){self.redo();ui.close_menu();}
      });
      ui.menu_button("Help",|ui|{
        ui.label("Laser CNC Controller");ui.label(format!("Version {}",env!("CARGO_PKG_VERSION")));
@@ -860,7 +1291,7 @@ impl LaserApp {
      widgets::num_u32(ui,"spot_power",&mut self.spot_power,1,0,max,&format!("/ {max}"));
      ui.separator();
      if Self::action(ui,"Trace",Color32::from_rgb(85,92,110)).on_hover_text("Trace the selected outline at spot power and trace feed, relative to the job origin").clicked(){
-       match self.trace_program(){Ok((lines,path))=>self.begin_run("Trace",lines,path),Err(e)=>self.notice=e}
+       match self.trace_program(){Ok(lines)=>self.begin_run("Trace",lines),Err(e)=>self.notice=e}
      }
      let fence_on=self.project.fence.on;
      if !fence_on&&self.trace_target==TraceTarget::Fence{self.trace_target=TraceTarget::Job;}
@@ -874,7 +1305,7 @@ impl LaserApp {
      widgets::num_f32(ui,"frame_feed",&mut self.frame_feed,100.0,1.0,10000.0,0,"mm/min");
      ui.separator();
      if Self::action(ui,"⏵ Start",Color32::from_rgb(27,125,68)).clicked(){
-       if !self.plan.moves.is_empty()&&self.plan.warnings.is_empty(){let lines=self.plan.lines.clone();let path=self.plan.moves.clone();self.begin_run("Job",lines,path);}
+       if !self.plan.moves.is_empty()&&self.plan.warnings.is_empty(){let lines=self.plan.lines.clone();self.begin_run("Job",lines);}
        else{self.notice="Start requires a valid toolpath and no warnings".into();}
      }
      // Pause/Resume driven by the GRBL state word from status reports.
@@ -925,19 +1356,28 @@ impl LaserApp {
    });
    ui.add_space(2.0);
  }
+ /// Canvas tool strip (docked: two rows; floating: wraps to the window width).
+ fn canvas_tools(&mut self,ui:&mut egui::Ui,docked:bool){
+   let (cu,cr)=(!self.undo.is_empty()&&!self.project.read_only,!self.redo.is_empty()&&!self.project.read_only);
+   let ev=self.view.toolbar(ui,&mut self.project,&mut self.selected,docked,cu,cr);
+   self.handle(ev);
+ }
  fn canvas(&mut self,ui:&mut egui::Ui){
-   if self.view.toolbar(ui,&mut self.project,&mut self.selected){self.regenerate();}
+   if !self.panels[TOOLS].floating{
+     // Docked above the canvas; the arrow collapses it to its title bar. Open by default.
+     let state=CollapsingState::load_with_default_open(ui.ctx(),egui::Id::new(("panel",TITLES[TOOLS])),true);
+     let _=state.show_header(ui,|ui|self.panel_header(ui,TOOLS)).body_unindented(|ui|{self.canvas_tools(ui,true);});
+   }
    ui.add_space(2.0);
    let sim=match &self.live{
-     // Live run: own path, progress from the reported position.
-     Some(lv)=>{
-       // Laser colour: the virtual controller's state in Simulate, else the current path segment (burn / travel).
-       let laser=self.machine.sim_laser().unwrap_or_else(||lv.path.get(lv.progress).is_some_and(|m|m.laser));
-       SimOverlay{active:lv.head.is_some(),index:lv.progress,head:lv.head.unwrap_or(lv.origin),start:lv.origin,path:Some(lv.path.as_slice()),laser}
-     }
-     None=>SimOverlay{active:false,index:0,head:self.plan.origin,start:self.plan.origin,path:None,laser:false},
+     // Live run: its planned path; head, progress and laser colour from the run clock.
+     Some(lv)=>{let total=lv.traj.duration();
+       SimOverlay{active:true,index:lv.progress,head:lv.head,start:lv.start,path:Some(lv.path.as_slice()),laser:lv.laser,
+         timer:Some((lv.clock.min(total),total,self.machine.state.starts_with("Hold")||self.machine.state.starts_with("Door")))}}
+     None=>SimOverlay{active:false,index:0,head:self.plan.origin,start:self.plan.origin,path:None,laser:false,timer:None},
    };
-   if self.view.show(ui,&mut self.project,&mut self.selected,&self.plan,&sim){self.regenerate();}
+   let ev=self.view.show(ui,&mut self.project,&mut self.selected,&self.plan,&sim);
+   self.handle(ev);
    // A newly selected shape expands the docked Shape Properties panel.
    if !self.selected.is_empty()&&self.selected!=self.props_last_sel&&!self.panels[PROPS].floating {self.show_panel(ui.ctx(),PROPS);}
    self.props_last_sel=self.selected.clone();
@@ -1036,8 +1476,10 @@ impl LaserApp {
          if !r.has_focus()&&ui.memory(|m|m.focused().is_none()){r.request_focus();}
          let enter=ui.input(|i|i.key_pressed(egui::Key::Enter));
          if ui.input(|i|i.key_pressed(egui::Key::Escape)){next=Some(Dialog::None);}
+         let reserved=self.builtin_names.iter().any(|n|n==name.trim());
+         if reserved{ui.colored_label(Color32::from_rgb(240,95,95),"That name belongs to a built-in example. Choose another.");}
          ui.horizontal(|ui|{
-           let ok=!name.trim().is_empty();
+           let ok=!name.trim().is_empty()&&!reserved;
            if ui.add_enabled(ok,egui::Button::new("Save")).clicked()||(enter&&ok){
              let n=name.trim().to_string();
              // Re-saving this project's own entry is not an overwrite of another project.
@@ -1087,6 +1529,78 @@ impl LaserApp {
        });
        next.unwrap_or(Dialog::Unsaved{then})
      }
+     Dialog::ReadOnly=>{
+       let mut next=None;
+       modal("Read-only Example").show(ctx,|ui|{
+         ui.set_max_width(380.0);
+         ui.label(format!("'{}' is a built-in example and cannot be changed. The edit was undone.",self.project.name));
+         ui.label("Duplicate it to get an editable copy?");
+         ui.horizontal(|ui|{
+           if ui.button("Duplicate").clicked(){
+             let base=self.project.name.trim_start_matches("Example - ").trim_start_matches("Calibration - ").to_string();
+             next=Some(Dialog::SaveAs{name:format!("{base} - Copy"),copy:true,then:None});
+           }
+           if ui.button("Cancel").clicked()||ui.input(|i|i.key_pressed(egui::Key::Escape)){next=Some(Dialog::None);}
+         });
+       });
+       next.unwrap_or(Dialog::ReadOnly)
+     }
+     Dialog::Calibration{mut params,mut error}=>{
+       let mut next=None;
+       modal("New Calibration Pattern").show(ctx,|ui|{
+         ui.set_max_width(420.0);
+         egui::ComboBox::from_id_salt("cal_kind").width(200.0).selected_text(params.kind.name()).show_ui(ui,|ui|{
+           for k in [CalKind::PowerFeed,CalKind::Density,CalKind::Direction,CalKind::Overscan]{ui.selectable_value(&mut params.kind,k,k.name());}
+         });
+         let max=self.max_power;
+         egui::Grid::new("cal_grid").num_columns(2).spacing(Vec2::new(10.0,6.0)).show(ui,|ui|{
+           let p=&mut params;
+           match p.kind{
+             CalKind::PowerFeed=>{
+               ui.label("Power from");widgets::num_u32(ui,"cal_p0",&mut p.power_from,10,0,max,&format!("/ {max}"));ui.end_row();
+               ui.label("Power to");widgets::num_u32(ui,"cal_p1",&mut p.power_to,10,0,max,&format!("/ {max}"));ui.end_row();
+               ui.label("Power steps (rows)");widgets::num_u32(ui,"cal_pn",&mut p.power_steps,1,1,30,"");ui.end_row();
+               ui.label("Feed from");widgets::num_f32(ui,"cal_f0",&mut p.feed_from,100.0,1.0,30000.0,0,"mm/min");ui.end_row();
+               ui.label("Feed to");widgets::num_f32(ui,"cal_f1",&mut p.feed_to,100.0,1.0,30000.0,0,"mm/min");ui.end_row();
+               ui.label("Feed steps (columns)");widgets::num_u32(ui,"cal_fn",&mut p.feed_steps,1,1,30,"");ui.end_row();
+               ui.label("Density");widgets::num_f32(ui,"cal_lpm",&mut p.lpm,1.0,0.1,100.0,1,"lines/mm");ui.end_row();
+             }
+             CalKind::Density=>{
+               ui.label("Density from");widgets::num_f32(ui,"cal_l0",&mut p.lpm_from,1.0,0.1,100.0,1,"lines/mm");ui.end_row();
+               ui.label("Density to");widgets::num_f32(ui,"cal_l1",&mut p.lpm_to,1.0,0.1,100.0,1,"lines/mm");ui.end_row();
+               ui.label("Steps (rows)");widgets::num_u32(ui,"cal_ln",&mut p.lpm_steps,1,1,30,"");ui.end_row();
+             }
+             CalKind::Overscan=>{
+               ui.label("Overscan up to");widgets::num_f32(ui,"cal_o1",&mut p.overscan_max,0.5,0.0,50.0,2,"mm");ui.end_row();
+               ui.label("Steps (rows, from 0)");widgets::num_u32(ui,"cal_on",&mut p.overscan_steps,1,1,30,"");ui.end_row();
+             }
+             CalKind::Direction=>{ui.label("Rows");ui.weak("horizontal, vertical, crosshatch, concentric, trace along, trace across");ui.end_row();}
+           }
+           if p.kind!=CalKind::PowerFeed{
+             ui.label("Power");widgets::num_u32(ui,"cal_pw",&mut p.power,10,0,max,&format!("/ {max}"));ui.end_row();
+             ui.label("Feed");widgets::num_f32(ui,"cal_fd",&mut p.feed,100.0,1.0,30000.0,0,"mm/min");ui.end_row();
+             if p.kind!=CalKind::Density{ui.label("Density");widgets::num_f32(ui,"cal_lp",&mut p.lpm,1.0,0.1,100.0,1,"lines/mm");ui.end_row();}
+           }
+           ui.label("Patch width");widgets::num_f32(ui,"cal_w",&mut p.patch_w,1.0,0.5,200.0,1,"mm");ui.end_row();
+           ui.label("Patch height");widgets::num_f32(ui,"cal_h",&mut p.patch_h,1.0,0.5,200.0,1,"mm");ui.end_row();
+           ui.label("Gap");widgets::num_f32(ui,"cal_g",&mut p.gap,0.5,0.0,100.0,1,"mm");ui.end_row();
+           ui.label("Placement");ui.checkbox(&mut p.on_tape,"on the 50 × 100 mm tape (5 mm clearance)");ui.end_row();
+         });
+         ui.weak("Labels go on the Notes layer. The project opens unsaved and editable.");
+         if !error.is_empty(){ui.colored_label(Color32::from_rgb(240,95,95),&error);}
+         ui.horizontal(|ui|{
+           if ui.button("Create").clicked(){
+             match examples::calibration(&params){
+               Ok(p)=>{self.cal_params=params.clone();self.request(Pending::Load(Box::new(p)));next=Some(Dialog::None);}
+               Err(e)=>error=e,
+             }
+           }
+           if ui.button("Cancel").clicked(){self.cal_params=params.clone();next=Some(Dialog::None);}
+         });
+       });
+       // A Create that went through the unsaved-changes prompt leaves that prompt in self.dialog.
+       match next{Some(Dialog::None) if !matches!(self.dialog,Dialog::None)=>std::mem::replace(&mut self.dialog,Dialog::None),Some(d)=>d,None=>Dialog::Calibration{params,error}}
+     }
      Dialog::Notice{title,msg}=>{
        let mut next=None;
        modal(&title).show(ctx,|ui|{
@@ -1101,17 +1615,11 @@ impl LaserApp {
  }
 }
 
-/// Distance from point p to segment a-b.
-fn seg_dist(p:(f32,f32),a:(f32,f32),b:(f32,f32))->f32{
-  let (dx,dy)=(b.0-a.0,b.1-a.1);let l2=dx*dx+dy*dy;
-  let t=if l2>0.0{(((p.0-a.0)*dx+(p.1-a.1)*dy)/l2).clamp(0.0,1.0)}else{0.0};
-  ((p.0-a.0-t*dx).powi(2)+(p.1-a.1-t*dy).powi(2)).sqrt()
-}
-
 impl eframe::App for LaserApp {
  fn update(&mut self,ctx:&egui::Context,_frame:&mut eframe::Frame){
-   let dt=self.last_frame.elapsed().as_secs_f32().min(0.2);self.last_frame=Instant::now();
    self.machine.poll();
+   // Re-plan when the motion limits change (connect / $$ received / disconnect / Machine Profile).
+   if Self::motion_config(&self.profile,&self.machine)!=self.motion{self.regenerate();}
    // A controller reset (banner) or disconnect invalidates the work zero and the spot state.
    if self.machine.reset_count!=self.seen_resets||!self.machine.connected(){
      self.seen_resets=self.machine.reset_count;self.zero_x=false;self.zero_y=false;self.spot_on=false;self.jog_pred=None;
@@ -1119,13 +1627,12 @@ impl eframe::App for LaserApp {
    if self.machine.state.starts_with("Alarm"){self.spot_on=false;}
    self.drain_journal();
    self.track_run();
-   self.update_live(dt);
-   // Drawing on an empty canvas starts an (unsaved) project.
-   if !self.project_active&&!self.project.shapes.is_empty(){self.project_active=true;self.saved_once=false;}
-   self.dirty=self.project_active&&Self::comparable_json(&self.project)!=self.saved_json;
-   let title=format!("Laser CNC Controller v{}{}",env!("CARGO_PKG_VERSION"),
-     if self.project_active{format!(" — {}{}",self.project.name,if self.dirty{" *"}else{""})}else{String::new()});
-   if title!=self.last_title {ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));self.last_title=title;}
+   self.update_live();
+   // Undo / redo keys (not while a text field has focus).
+   if matches!(self.dialog,Dialog::None)&&ctx.memory(|m|m.focused().is_none()){
+     let (z,y,shift,cmd)=ctx.input(|i|(i.key_pressed(egui::Key::Z),i.key_pressed(egui::Key::Y),i.modifiers.shift,i.modifiers.command));
+     if cmd&&z&&!shift{self.undo();}else if cmd&&(y||(z&&shift)){self.redo();}
+   }
    egui::TopBottomPanel::top("top_bar").show(ctx,|ui|self.toolbar(ui));
    self.panels_layout(ctx);
    egui::CentralPanel::default().show(ctx,|ui|{
@@ -1135,6 +1642,17 @@ impl eframe::App for LaserApp {
      self.canvas(ui);
    });
    self.dialogs(ctx);
+   // After the UI: commit this frame's edit to the history (or undo it on a read-only example),
+   // then the unsaved marker and window title.
+   let json=Self::comparable_json(&self.project);
+   self.track_history(&json);
+   let json=if json==self.hist_json{json}else{Self::comparable_json(&self.project)};
+   // Drawing on an empty canvas starts an (unsaved) project.
+   if !self.project_active&&!self.project.shapes.is_empty(){self.project_active=true;self.saved_once=false;}
+   self.dirty=self.project_active&&json!=self.saved_json;
+   let title=format!("Laser CNC Controller v{}{}",env!("CARGO_PKG_VERSION"),
+     if self.project_active{format!(" — {}{}{}",self.project.name,if self.project.read_only{" (read-only)"}else{""},if self.dirty{" *"}else{""})}else{String::new()});
+   if title!=self.last_title {ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));self.last_title=title;}
    ctx.request_repaint_after(std::time::Duration::from_millis(16));
  }
  fn save(&mut self,storage:&mut dyn eframe::Storage){
@@ -1147,5 +1665,5 @@ impl eframe::App for LaserApp {
 // =============================================================================
 // End of file: app.rs
 // Location:    laser-cnc-controller/src/app.rs
-// Created:     2026-10-13 18:25:33 UTC
+// Created:     2026-10-17 18:43:10 UTC
 // =============================================================================

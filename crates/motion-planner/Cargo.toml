@@ -1,0 +1,29 @@
+# =============================================================================
+# File:     Cargo.toml
+# Location: laser-cnc-controller/crates/motion-planner/Cargo.toml
+# Version:  v0.1.0
+# Comments: Package manifest for the motion-planner crate.
+#           no_std. The "alloc" feature (default) adds the whole-program
+#           planner (Trajectory) and the G-code line reader; without it only
+#           the allocation-free kinematics, junction and profile math remain,
+#           for firmware use.
+#           libm supplies f32 square root without std.
+# =============================================================================
+[package]
+name = "motion-planner"
+version = "0.1.0"
+edition = "2021"
+description = "no_std GRBL-style motion planner: look-ahead, trapezoidal acceleration, junction deviation, time-based trajectory"
+license = "MIT"
+
+[features]
+default = ["alloc"]
+alloc = []
+
+[dependencies]
+libm = "0.2"
+# =============================================================================
+# End of file: Cargo.toml
+# Location:    laser-cnc-controller/crates/motion-planner/Cargo.toml
+# Created:     2026-10-16 21:27:22 UTC
+# =============================================================================

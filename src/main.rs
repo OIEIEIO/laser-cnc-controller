@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     main.rs
 // Location: laser-cnc-controller/src/main.rs
-// Version:  v0.1.4
+// Version:  v0.1.5
 // Comments: Native application entry point.
 //           - v0.1.1: registers canvas and widgets modules.
 //           - v0.1.2: registers runlog module.
@@ -11,12 +11,17 @@
 //           - v0.1.3: default window 1280×700, minimum 990×600, so it fits a
 //             laptop screen at 150% scaling.
 //           - v0.1.4: registers vgrbl module (virtual GRBL for Simulate).
+//           - v0.1.5: registers examples, font and paths modules (canvas CAD
+//             update, app v0.2.1).
 // =============================================================================
 mod app;
 mod canvas;
+mod examples;
+mod font;
 mod geometry;
 mod gcode;
 mod machine;
+mod paths;
 mod runlog;
 mod storage;
 mod vgrbl;
@@ -44,5 +49,5 @@ fn egui_viewport() -> eframe::egui::ViewportBuilder {
 // =============================================================================
 // End of file: main.rs
 // Location:    laser-cnc-controller/src/main.rs
-// Created:     2026-10-13 17:54:31 UTC
+// Created:     2026-10-17 17:35:38 UTC
 // =============================================================================

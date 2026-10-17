@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     machine.rs
 // Location: laser-cnc-controller/src/machine.rs
-// Version:  v0.1.5
+// Version:  v0.1.6
 // Comments: GRBL 0.9i serial transport.
 //           v0.1.1:
 //           - Machine state word parsed from status reports (<Run,...>,
@@ -42,6 +42,8 @@
 //           - simulate (set while disconnected): Connect attaches the virtual
 //             controller ("SIMULATOR"). sim_speed scales its time (1–50x),
 //             changeable during a run. sim_laser() reports its laser state.
+//           v0.1.6: sim_laser() removed (the app takes the laser state from
+//           its motion-planner trajectory in both live and Simulate runs).
 // =============================================================================
 use std::collections::VecDeque;
 use std::io::{Read,Write};
@@ -129,8 +131,6 @@ impl Default for Machine {fn default()->Self{Self{worker:None,link:Link::Disconn
 impl Machine {
     pub fn refresh(&mut self){if let Ok(ports)=serialport::available_ports(){self.ports=ports.into_iter().map(|p|p.port_name).collect();if self.selected_port.is_empty(){if let Some(s)=self.ports.first(){self.selected_port=s.clone();}}}}
     pub fn connected(&self)->bool{self.link==Link::Connected}
-    /// Virtual controller laser state (Simulate mode only).
-    pub fn sim_laser(&self)->Option<bool>{self.sim.as_ref().map(|s|s.laser.load(std::sync::atomic::Ordering::Relaxed))}
     pub fn set_sim_speed(&mut self,speed:f32){self.sim_speed=speed;if let Some(s)=&self.sim{s.set_speed(speed);}}
     /// Label of the port in use (hardware port name or SIMULATOR).
     pub fn port_label(&self)->String{if self.simulate{"SIMULATOR".into()}else{self.selected_port.clone()}}
@@ -427,5 +427,5 @@ impl Worker{
 // =============================================================================
 // End of file: machine.rs
 // Location:    laser-cnc-controller/src/machine.rs
-// Created:     2026-10-13 17:54:31 UTC
+// Created:     2026-10-16 21:27:22 UTC
 // =============================================================================

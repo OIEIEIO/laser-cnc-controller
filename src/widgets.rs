@@ -1,7 +1,7 @@
 // =============================================================================
 // File:     widgets.rs
 // Location: laser-cnc-controller/src/widgets.rs
-// Version:  v0.1.1
+// Version:  v0.1.2
 // Comments: Shared UI widgets.
 //           - Numeric spin field: typed entry (commit on Enter / focus loss)
 //             plus ▲▼ step buttons. No drag-to-change, no sliders.
@@ -9,6 +9,8 @@
 //             dependency, crisp at any scale).
 //           v0.1.1: Origin (job 0,0 marker tool) and Fence (work fence
 //           on/off) icons.
+//           v0.1.2 (app v0.2.1): Polyline, Text, Undo, Redo, Merge, Order
+//           (burn order numbers) and FitContent (zoom to shapes) icons.
 // =============================================================================
 use eframe::egui::{self,Align,Color32,CornerRadius,Pos2,Rect,Sense,Stroke,Vec2};
 
@@ -80,7 +82,7 @@ pub fn num_u32(ui:&mut egui::Ui,id_salt:&str,value:&mut u32,step:u32,min:u32,max
 }
 
 #[derive(Clone,Copy,PartialEq)]
-pub enum Icon{Select,Pan,Move,Origin,Rectangle,Line,Circle,Duplicate,Delete,Clear,Grid,Snap,Fit,Fence}
+pub enum Icon{Select,Pan,Move,Origin,Rectangle,Line,Circle,Duplicate,Delete,Clear,Grid,Snap,Fit,Fence,Polyline,Text,Undo,Redo,Merge,Order,FitContent}
 
 /// Square icon button. `selected` draws it in the accent (active tool / toggle on).
 pub fn icon_button(ui:&mut egui::Ui,icon:Icon,selected:bool,enabled:bool,tip:&str)->egui::Response{
@@ -159,10 +161,45 @@ fn paint_icon(p:&egui::Painter,r:Rect,icon:Icon,c:Color32){
       }
       p.rect_stroke(Rect::from_min_max(at(0.32,0.32),at(0.68,0.68)),0.0,Stroke::new(1.2_f32,c),egui::StrokeKind::Inside);
     }
+    Icon::Polyline=>{
+      p.add(egui::Shape::line(vec![at(0.05,0.90),at(0.30,0.25),at(0.62,0.70),at(0.95,0.10)],s));
+      for (x,y) in [(0.05,0.90),(0.30,0.25),(0.62,0.70),(0.95,0.10)]{p.circle_filled(at(x,y),2.0,c);}
+    }
+    Icon::Text=>{
+      p.line_segment([at(0.10,0.10),at(0.90,0.10)],s);p.line_segment([at(0.50,0.10),at(0.50,0.95)],s);
+      p.line_segment([at(0.35,0.95),at(0.65,0.95)],Stroke::new(1.2_f32,c));
+    }
+    Icon::Undo|Icon::Redo=>{
+      let flip=icon==Icon::Redo;
+      let fx=|x:f32|if flip{1.0-x}else{x};
+      let pts:Vec<Pos2>=(0..=10).map(|i|{let t=std::f32::consts::PI*(i as f32/10.0);at(fx(0.55+0.38*t.sin()),0.55-0.30*t.cos())}).collect();
+      p.add(egui::Shape::line(pts,s));
+      p.line_segment([at(fx(0.55),0.25),at(fx(0.18),0.25)],s);
+      arrow_head(at(fx(0.08),0.25),Vec2::new(if flip{1.0}else{-1.0},0.0));
+    }
+    Icon::Merge=>{
+      p.rect_stroke(Rect::from_min_max(at(0.0,0.55),at(1.0,0.95)),0.0,Stroke::new(1.2_f32,c.gamma_multiply(0.6)),egui::StrokeKind::Inside);
+      p.rect_stroke(Rect::from_min_max(at(0.15,0.05),at(0.45,0.60)),0.0,Stroke::new(1.2_f32,c.gamma_multiply(0.6)),egui::StrokeKind::Inside);
+      p.add(egui::Shape::closed_line(vec![at(0.0,0.95),at(1.0,0.95),at(1.0,0.55),at(0.45,0.55),at(0.45,0.05),at(0.15,0.05),at(0.15,0.55),at(0.0,0.55)],s));
+    }
+    Icon::Order=>{
+      for (k,y) in [0.12f32,0.5,0.88].iter().enumerate(){
+        p.text(at(0.12,*y),egui::Align2::CENTER_CENTER,format!("{}",k+1),egui::FontId::proportional(9.0),c);
+        p.line_segment([at(0.35,*y),at(1.0,*y)],Stroke::new(1.4_f32,c));
+      }
+    }
+    Icon::FitContent=>{
+      let k=0.32;
+      for (x,y,dx,dy) in [(0.0,0.0,1.0,1.0),(1.0,0.0,-1.0,1.0),(0.0,1.0,1.0,-1.0),(1.0,1.0,-1.0,-1.0)]{
+        p.line_segment([at(x,y),at(x+dx*k,y)],s);p.line_segment([at(x,y),at(x,y+dy*k)],s);
+      }
+      p.circle_stroke(at(0.5,0.5),r.width()*0.16,Stroke::new(1.2_f32,c));
+      p.rect_stroke(Rect::from_min_max(at(0.30,0.36),at(0.56,0.62)),0.0,Stroke::new(1.0_f32,c),egui::StrokeKind::Inside);
+    }
   }
 }
 // =============================================================================
 // End of file: widgets.rs
 // Location:    laser-cnc-controller/src/widgets.rs
-// Created:     2026-10-13 17:35:14 UTC
+// Created:     2026-10-17 17:35:38 UTC
 // =============================================================================
